@@ -1,0 +1,53 @@
+nominal_capacity_ah: 150
+initial_soc: 1.0
+ambient_temp_k: 298.15
+voltage_low_v: 2.8
+voltage_high_v: 4.2
+discharge_rates_c:
+  - 0.2
+  - 0.5
+  - 1.0
+charge_cc_rate: 0.5
+cv_cutoff_c_rate: 0.05
+rest_min: 30
+period_s: 30
+output_dir: outputs/baseline_150ah_nmc622
+parameter_set: Chen2020
+model:
+  thermal: isothermal
+solver:
+  rtol: 1.0e-6
+  atol: 1.0e-8
+sanity_gate:
+  enabled: true
+  rate_c: 0.5
+  discharge_to_v: 3.6
+  charge_to_v: 4.1
+  period_s: 30
+hppc:
+  enabled: true
+  soc_start: 1.0
+  soc_end: 0.05
+  soc_step: 0.05
+  pulse_c_rate: 1.0
+  discharge_s: 10
+  charge_s: 10
+  rest_minutes: 30
+  period_s: 0.1
+timeseries:
+  enabled: true
+  csv_path: ""
+  period_s: 0.1
+  charge_compare:
+    enabled: true
+    soc_start: 0.0
+    rates_c:
+      - 0.1
+      - 0.3333333333
+      - 1.0
+    period_by_rate_s:
+      0.1: 1.0
+      0.3333333333: 0.1
+      1.0: 0.1
+    cv_cutoff_c_rate: 0.05
+    voltage_high_v: 4.2
