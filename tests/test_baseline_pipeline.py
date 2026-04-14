@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from batt_bamm.main import run_from_config
+from batt_bamm.hppc_compare import run_compare_pipeline
+from batt_bamm.main import _soc_grid, run_from_config
 
 
 def _discharge_segment(frame: pd.DataFrame) -> pd.DataFrame:
@@ -80,6 +81,7 @@ class TestBaselinePipeline(unittest.TestCase):
         cls._root.mkdir(parents=True, exist_ok=False)
 
         cls._base_config = {
+            "chemistry": "nmc",
             "nominal_capacity_ah": 150,
             "initial_soc": 1.0,
             "ambient_temp_k": 298.15,
@@ -91,7 +93,7 @@ class TestBaselinePipeline(unittest.TestCase):
             "rest_min": 5,
             "period_s": 120,
             "parameter_set": "Chen2020",
-            "model": {"thermal": "isothermal"},
+            "model": {"type": "dfn", "thermal": "isothermal"},
             "solver": {"rtol": 1e-6, "atol": 1e-8},
             "sanity_gate": {
                 "enabled": True,
@@ -136,11 +138,13 @@ class TestBaselinePipeline(unittest.TestCase):
         audit_path = self._batch_output / "parameter_audit.json"
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
         scaling = audit["scaling"]
+        parameter_pack = audit["parameter_pack"]
         ratio = scaling["scale_ratio"]
         nominal_ratio = scaling["target_nominal_capacity_ah"] / scaling["base_nominal_capacity_ah"]
         parallel_ratio = scaling["parallel_after"] / scaling["parallel_before"]
         self.assertTrue(np.isclose(ratio, nominal_ratio, atol=1e-12))
         self.assertTrue(np.isclose(parallel_ratio, nominal_ratio, atol=1e-12))
+        self.assertIn(parameter_pack["quality_level"], {"proxy", "identified"})
 
     def test_physical_sanity(self) -> None:
         for case in self._batch_summary["cases"]:
@@ -207,9 +211,15 @@ class TestBaselinePipeline(unittest.TestCase):
     def test_summary_contract(self) -> None:
         summary_path = self._batch_output / "summary.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        self.assertIn("contract_version", summary)
+        self.assertEqual(summary["contract_version"], "1.1.0")
+        self.assertIn("contract_fields", summary)
+        self.assertIn("stable_top_level_fields", summary["contract_fields"])
         self.assertIn("generated_at_utc", summary)
         self.assertIn("all_converged", summary)
         self.assertIn("config", summary)
+        self.assertIn("termination_policy", summary)
+        self.assertIn("termination_hits", summary)
         self.assertIn("artifacts", summary)
         self.assertIn("sanity_gate", summary)
         self.assertIn("cases", summary)
@@ -236,8 +246,37 @@ class TestBaselinePipeline(unittest.TestCase):
         self.assertEqual(set(gate), expected_gate)
 
         case = summary["cases"][0]
-        expected_case = {"case_id", "converged", "min_v", "max_v", "final_soc", "runtime_s", "csv_path", "error"}
+        expected_case = {"case_id", "converged", "min_v", "max_v", "final_soc", "runtime_s", "csv_path", "termination", "error"}
         self.assertEqual(set(case), expected_case)
+        self.assertEqual(
+            set(case["termination"]),
+            {"hit", "reason", "time_s", "index", "metric", "op", "threshold", "value"},
+        )
+
+    def test_baseline_termination_opt_out_for_experiment_modes(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "baseline_termination_opt_out"
+        cfg["output_dir"] = str(output_dir)
+        cfg["discharge_rates_c"] = [0.2]
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "apply_to_experiment_modes": False,
+            "conditions": [
+                {"metric": "time_s", "op": ">=", "threshold": 10.0, "name": "short_stop"},
+            ],
+        }
+        cfg_path = self._root / "baseline_termination_opt_out.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="baseline")
+        self.assertTrue(summary["all_converged"])
+        case = summary["cases"][0]
+        self.assertTrue(case["converged"])
+        self.assertFalse(case["termination"]["hit"])
+        frame = pd.read_csv(case["csv_path"])
+        self.assertGreater(float(frame["time_s"].iloc[-1]), 10.0)
 
 
 class TestHppcPipeline(unittest.TestCase):
@@ -249,6 +288,7 @@ class TestHppcPipeline(unittest.TestCase):
         cls._root.mkdir(parents=True, exist_ok=False)
 
         cls._base_config = {
+            "chemistry": "nmc",
             "nominal_capacity_ah": 150,
             "initial_soc": 1.0,
             "ambient_temp_k": 298.15,
@@ -260,7 +300,7 @@ class TestHppcPipeline(unittest.TestCase):
             "rest_min": 5,
             "period_s": 120,
             "parameter_set": "Chen2020",
-            "model": {"thermal": "isothermal"},
+            "model": {"type": "dfn", "thermal": "isothermal"},
             "solver": {"rtol": 1e-6, "atol": 1e-8},
             "sanity_gate": {"enabled": False},
             "hppc": {
@@ -296,13 +336,26 @@ class TestHppcPipeline(unittest.TestCase):
     def test_hppc_contract(self) -> None:
         self.assertTrue(self._summary["all_converged"])
         self.assertEqual(self._summary["mode"], "hppc")
+        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertIn("contract_fields", self._summary)
         hppc = self._summary["hppc"]
-        expected = {"enabled", "passed", "stop_reason", "completed_points", "total_points", "artifacts", "points"}
+        expected = {
+            "enabled",
+            "passed",
+            "stop_reason",
+            "completed_points",
+            "total_points",
+            "termination_policy",
+            "termination_hits",
+            "artifacts",
+            "points",
+        }
         self.assertEqual(set(hppc), expected)
         self.assertTrue(hppc["enabled"])
         self.assertTrue(hppc["passed"])
         self.assertEqual(hppc["completed_points"], 3)
         self.assertEqual(hppc["total_points"], 3)
+        self.assertGreaterEqual(hppc["termination_hits"], 0)
 
     def test_hppc_protocol_segments_present(self) -> None:
         for point in self._summary["hppc"]["points"]:
@@ -318,6 +371,7 @@ class TestHppcPipeline(unittest.TestCase):
             self.assertIsNotNone(point["r_chg_10s_ohm"])
             self.assertGreater(point["r_dis_10s_ohm"], 0.0)
             self.assertGreater(point["r_chg_10s_ohm"], 0.0)
+            self.assertIn("termination", point)
 
     def test_hppc_fail_fast(self) -> None:
         fail_output = self._root / "hppc_fail"
@@ -335,6 +389,144 @@ class TestHppcPipeline(unittest.TestCase):
         self.assertEqual(len(hppc["points"]), 1)
         self.assertFalse((fail_output / "hppc_point_soc_095.csv").exists())
 
+    def test_soc_grid_includes_zero_endpoint(self) -> None:
+        grid = _soc_grid(1.0, 0.0, 0.05)
+        self.assertEqual(grid[0], 1.0)
+        self.assertEqual(grid[-1], 0.0)
+        self.assertEqual(len(grid), 21)
+
+
+class TestHppcComparePipeline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        temp_root = Path.cwd() / ".tmp_tests"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        cls._root = temp_root / f"hppc_compare_pipeline_{int(time.time() * 1000)}"
+        cls._root.mkdir(parents=True, exist_ok=False)
+
+        dfn_output = cls._root / "dfn_run"
+        ecm_output = cls._root / "ecm_run"
+        compare_output = cls._root / "compare_ok"
+        cls._compare_output = compare_output
+
+        dfn_cfg = {
+            "chemistry": "nmc",
+            "nominal_capacity_ah": 150,
+            "initial_soc": 1.0,
+            "ambient_temp_k": 298.15,
+            "voltage_low_v": 2.8,
+            "voltage_high_v": 4.2,
+            "discharge_rates_c": [0.2],
+            "charge_cc_rate": 0.5,
+            "cv_cutoff_c_rate": 0.05,
+            "rest_min": 5,
+            "period_s": 30,
+            "parameter_set": "Chen2020",
+            "model": {"type": "dfn", "thermal": "isothermal"},
+            "solver": {"rtol": 1e-6, "atol": 1e-8},
+            "quality_gate": {"enabled": True, "enforce": True},
+            "benchmark": {"enabled": False},
+            "identification_inputs": {"enabled": False, "strict": True},
+            "termination": {"enabled": True, "logic": "any_of", "must_hit": False, "conditions": []},
+            "sanity_gate": {"enabled": False},
+            "hppc": {
+                "enabled": True,
+                "soc_start": 0.95,
+                "soc_end": 0.85,
+                "soc_step": 0.05,
+                "pulse_c_rate": 1.0,
+                "discharge_s": 10,
+                "charge_s": 10,
+                "rest_minutes": 0.1,
+                "period_s": 0.2,
+            },
+            "timeseries": {"enabled": False},
+            "output_dir": str(dfn_output),
+        }
+        ecm_cfg = _deep_copy_dict(dfn_cfg)
+        ecm_cfg["model"] = {"type": "ecm", "thermal": "isothermal"}
+        ecm_cfg["parameter_set"] = "ECM_Example"
+        ecm_cfg["voltage_low_v"] = 3.2
+        ecm_cfg["output_dir"] = str(ecm_output)
+
+        cls._dfn_cfg_path = cls._root / "dfn_hppc.yaml"
+        cls._ecm_cfg_path = cls._root / "ecm_hppc.yaml"
+        cls._dfn_cfg_path.write_text(yaml.safe_dump(dfn_cfg), encoding="utf-8")
+        cls._ecm_cfg_path.write_text(yaml.safe_dump(ecm_cfg), encoding="utf-8")
+
+        cls._summary = run_compare_pipeline(
+            dfn_config_path=cls._dfn_cfg_path,
+            ecm_config_path=cls._ecm_cfg_path,
+            output_dir=compare_output,
+            cell_id="nmc150_compare_smoke",
+        )
+
+    def test_compare_smoke_outputs_exist(self) -> None:
+        self.assertTrue((self._compare_output / "hppc_compare_by_soc.csv").exists())
+        self.assertTrue((self._compare_output / "hppc_compare_summary.json").exists())
+        self.assertTrue((self._compare_output / "hppc_compare_voltage_delta.png").exists())
+        self.assertTrue((self._compare_output / "hppc_compare_report.md").exists())
+
+    def test_compare_contract(self) -> None:
+        summary = self._summary
+        self.assertTrue(summary["passed"])
+        expected = {
+            "generated_at_utc",
+            "cell_id",
+            "chemistry",
+            "nominal_capacity_ah",
+            "soc_grid",
+            "dfn_run",
+            "ecm_run",
+            "completed_points",
+            "passed",
+            "metrics",
+            "artifacts",
+        }
+        self.assertTrue(expected.issubset(set(summary.keys())))
+        self.assertEqual(summary["completed_points"], 3)
+        self.assertIn("mae_v_dis_end_v", summary["metrics"])
+        self.assertIn("max_abs_delta_v_dis_end_v", summary["metrics"])
+        self.assertIn("rmse_v_dis_end_v", summary["metrics"])
+        self.assertIn("worst_soc_target", summary["metrics"])
+
+    def test_compare_csv_contract(self) -> None:
+        frame = pd.read_csv(self._compare_output / "hppc_compare_by_soc.csv")
+        expected_cols = {
+            "soc_target",
+            "v_dis_end_dfn",
+            "v_dis_end_ecm",
+            "delta_v_dis_end_v",
+            "abs_delta_v_dis_end_v",
+            "v_dis_rest_start_dfn",
+            "v_dis_rest_start_ecm",
+            "delta_v_dis_rest_start_v",
+            "r_dis_10s_ohm_dfn",
+            "r_dis_10s_ohm_ecm",
+            "delta_r_dis_10s_ohm",
+        }
+        self.assertEqual(set(frame.columns), expected_cols)
+        self.assertEqual(len(frame), 3)
+
+    def test_compare_failure_semantics(self) -> None:
+        fail_output = self._root / "compare_fail"
+        ecm_fail_cfg = yaml.safe_load(self._ecm_cfg_path.read_text(encoding="utf-8"))
+        ecm_fail_cfg["hppc"]["pulse_c_rate"] = 0.0
+        ecm_fail_cfg["output_dir"] = str(self._root / "ecm_fail_run")
+        ecm_fail_path = self._root / "ecm_fail_hppc.yaml"
+        ecm_fail_path.write_text(yaml.safe_dump(ecm_fail_cfg), encoding="utf-8")
+
+        summary = run_compare_pipeline(
+            dfn_config_path=self._dfn_cfg_path,
+            ecm_config_path=ecm_fail_path,
+            output_dir=fail_output,
+            cell_id="nmc150_compare_fail",
+        )
+        self.assertFalse(summary["passed"])
+        self.assertIn("ECM HPPC run failed", summary["stop_reason"])
+        self.assertTrue((fail_output / "hppc_compare_summary.json").exists())
+        self.assertTrue((fail_output / "hppc_compare_by_soc.csv").exists())
+
 
 class TestTimeseriesPipeline(unittest.TestCase):
     @classmethod
@@ -348,6 +540,7 @@ class TestTimeseriesPipeline(unittest.TestCase):
         _write_timeseries_csv(cls._csv_path, duration_s=120.0, period_s=1.0, current_a=20.0, temp_k=298.15)
 
         cls._base_config = {
+            "chemistry": "nmc",
             "nominal_capacity_ah": 150,
             "initial_soc": 1.0,
             "ambient_temp_k": 298.15,
@@ -359,7 +552,7 @@ class TestTimeseriesPipeline(unittest.TestCase):
             "rest_min": 5,
             "period_s": 30,
             "parameter_set": "Chen2020",
-            "model": {"thermal": "isothermal"},
+            "model": {"type": "dfn", "thermal": "isothermal"},
             "solver": {"rtol": 1e-6, "atol": 1e-8},
             "sanity_gate": {"enabled": False},
             "hppc": {"enabled": False},
@@ -386,8 +579,19 @@ class TestTimeseriesPipeline(unittest.TestCase):
     def test_timeseries_contract(self) -> None:
         self.assertTrue(self._summary["all_converged"])
         self.assertEqual(self._summary["mode"], "timeseries")
+        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertIn("contract_fields", self._summary)
         payload = self._summary["timeseries"]
-        expected = {"enabled", "passed", "stop_reason", "source_csv", "artifacts", "case"}
+        expected = {
+            "enabled",
+            "passed",
+            "stop_reason",
+            "source_csv",
+            "termination_policy",
+            "termination_hits",
+            "artifacts",
+            "case",
+        }
         self.assertEqual(set(payload), expected)
         self.assertTrue(payload["enabled"])
         self.assertTrue(payload["passed"])
@@ -396,10 +600,29 @@ class TestTimeseriesPipeline(unittest.TestCase):
 
     def test_timeseries_physical_sanity(self) -> None:
         frame = pd.read_csv(self._output / "timeseries_output.csv")
+        self.assertIn("ocv_v", frame.columns)
         self.assertTrue((frame["voltage_v"] > 0).all())
         self.assertTrue((frame["voltage_v"] < 5).all())
         self.assertLessEqual(frame["soc"].iloc[-1], frame["soc"].iloc[0] + 1e-6)
         self.assertTrue(np.allclose(frame["temperature_k"].to_numpy(), 298.15))
+
+    def test_timeseries_lumped_shows_temperature_rise(self) -> None:
+        hot_csv = self._root / "input_timeseries_hot.csv"
+        _write_timeseries_csv(hot_csv, duration_s=180.0, period_s=1.0, current_a=300.0, temp_k=298.15)
+
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "lumped_outputs"
+        cfg["output_dir"] = str(output_dir)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["timeseries"]["csv_path"] = str(hot_csv)
+        cfg_path = self._root / "timeseries_lumped.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        temp = frame["temperature_k"].to_numpy(dtype=float)
+        self.assertGreater(float(np.max(temp) - np.min(temp)), 1e-6)
 
     def test_timeseries_repeatability(self) -> None:
         output_a = self._root / "repeat_a"
@@ -473,6 +696,112 @@ class TestTimeseriesPipeline(unittest.TestCase):
         self.assertFalse(summary["all_converged"])
         self.assertIn("NaN", summary["timeseries"]["stop_reason"])
 
+    def test_timeseries_invalid_thermal_option(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["model"]["thermal"] = "x-full"
+        cfg["output_dir"] = str(self._root / "invalid_thermal")
+        cfg_path = self._root / "timeseries_invalid_thermal.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            run_from_config(cfg_path, mode="timeseries")
+
+    def test_timeseries_termination_time_cutoff(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "termination_time_cutoff"
+        cfg["output_dir"] = str(output_dir)
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "conditions": [
+                {"metric": "time_s", "op": ">=", "threshold": 40.0, "name": "time_gate"},
+            ],
+        }
+        cfg_path = self._root / "timeseries_termination_time.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        case = summary["timeseries"]["case"]
+        self.assertTrue(case["converged"])
+        self.assertTrue(case["termination"]["hit"])
+        self.assertEqual(case["termination"]["reason"], "time_gate")
+        self.assertTrue(np.isclose(case["termination"]["time_s"], 40.0, atol=1.0))
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        self.assertLessEqual(float(frame["time_s"].iloc[-1]), 40.0 + 1e-6)
+
+    def test_timeseries_termination_ocv_metric(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "termination_ocv_cutoff"
+        cfg["output_dir"] = str(output_dir)
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "conditions": [
+                {"metric": "ocv_v", "op": ">=", "threshold": 0.0, "name": "ocv_available"},
+            ],
+        }
+        cfg_path = self._root / "timeseries_termination_ocv.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        case = summary["timeseries"]["case"]
+        self.assertTrue(case["termination"]["hit"])
+        self.assertEqual(case["termination"]["metric"], "ocv_v")
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        self.assertIn("ocv_v", frame.columns)
+
+    def test_timeseries_lumped_temp_boundary_from_csv(self) -> None:
+        boundary_csv = self._root / "input_timeseries_boundary.csv"
+        times = np.arange(0.0, 121.0, 1.0)
+        frame = pd.DataFrame(
+            {
+                "time_s": times,
+                "current_a": np.zeros(times.shape, dtype=float),
+                "temp_k": np.linspace(298.15, 310.15, len(times)),
+            }
+        )
+        frame.to_csv(boundary_csv, index=False)
+
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "lumped_boundary_outputs"
+        cfg["output_dir"] = str(output_dir)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["timeseries"]["csv_path"] = str(boundary_csv)
+        cfg["timeseries"]["use_temp_as_ambient_boundary"] = True
+        cfg_path = self._root / "timeseries_lumped_boundary.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        out = pd.read_csv(output_dir / "timeseries_output.csv")
+        temp = out["temperature_k"].to_numpy(dtype=float)
+        self.assertGreater(float(np.max(temp) - np.min(temp)), 1e-3)
+
+    def test_timeseries_termination_must_hit_failure(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "termination_must_hit_failure"
+        cfg["output_dir"] = str(output_dir)
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "conditions": [
+                {"metric": "soc", "op": "<=", "threshold": -0.1},
+            ],
+        }
+        cfg_path = self._root / "timeseries_termination_must_hit.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertFalse(summary["all_converged"])
+        self.assertIn("No termination condition was met", summary["timeseries"]["stop_reason"])
+        case = summary["timeseries"]["case"]
+        self.assertFalse(case["converged"])
+        self.assertFalse(case["termination"]["hit"])
+
 
 class TestChargeComparePipeline(unittest.TestCase):
     @classmethod
@@ -483,6 +812,7 @@ class TestChargeComparePipeline(unittest.TestCase):
         cls._root.mkdir(parents=True, exist_ok=False)
 
         cls._base_config = {
+            "chemistry": "nmc",
             "nominal_capacity_ah": 150,
             "initial_soc": 1.0,
             "ambient_temp_k": 298.15,
@@ -494,7 +824,7 @@ class TestChargeComparePipeline(unittest.TestCase):
             "rest_min": 5,
             "period_s": 30,
             "parameter_set": "Chen2020",
-            "model": {"thermal": "isothermal"},
+            "model": {"type": "dfn", "thermal": "isothermal"},
             "solver": {"rtol": 1e-6, "atol": 1e-8},
             "sanity_gate": {"enabled": False},
             "hppc": {"enabled": False},
@@ -535,13 +865,25 @@ class TestChargeComparePipeline(unittest.TestCase):
 
     def test_charge_compare_contract(self) -> None:
         self.assertEqual(self._summary["mode"], "timeseries")
+        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertIn("contract_fields", self._summary)
         self.assertIn("charge_compare", self._summary)
         payload = self._summary["charge_compare"]
-        expected = {"enabled", "passed", "completed_cases", "total_cases", "artifacts", "cases"}
+        expected = {
+            "enabled",
+            "passed",
+            "completed_cases",
+            "total_cases",
+            "termination_policy",
+            "termination_hits",
+            "artifacts",
+            "cases",
+        }
         self.assertEqual(set(payload), expected)
         self.assertTrue(payload["enabled"])
         self.assertEqual(payload["total_cases"], 3)
         self.assertEqual(len(payload["cases"]), 3)
+        self.assertTrue(all("termination" in case for case in payload["cases"]))
 
     def test_charge_compare_sampling(self) -> None:
         for case in self._summary["charge_compare"]["cases"]:
@@ -584,6 +926,282 @@ class TestChargeComparePipeline(unittest.TestCase):
         failed = [case for case in payload["cases"] if not case["converged"]]
         self.assertGreaterEqual(len(failed), 1)
         self.assertTrue(any("No sampling period configured" in (case["error"] or "") for case in failed))
+
+
+class TestModelChemistryCoverage(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        temp_root = Path.cwd() / ".tmp_tests"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        cls._root = temp_root / f"coverage_pipeline_{int(time.time() * 1000)}"
+        cls._root.mkdir(parents=True, exist_ok=False)
+
+    def test_ecm_timeseries_smoke(self) -> None:
+        csv_path = self._root / "ecm_timeseries.csv"
+        _write_timeseries_csv(csv_path, duration_s=120.0, period_s=1.0, current_a=20.0, temp_k=298.15)
+        output_dir = self._root / "ecm_timeseries_outputs"
+        cfg = {
+            "chemistry": "nmc",
+            "nominal_capacity_ah": 150,
+            "initial_soc": 1.0,
+            "ambient_temp_k": 298.15,
+            "voltage_low_v": 2.8,
+            "voltage_high_v": 4.2,
+            "discharge_rates_c": [0.2],
+            "charge_cc_rate": 0.5,
+            "cv_cutoff_c_rate": 0.05,
+            "rest_min": 1,
+            "period_s": 30,
+            "parameter_set": "ECM_Example",
+            "model": {"type": "ecm", "thermal": "isothermal"},
+            "solver": {"rtol": 1e-6, "atol": 1e-8},
+            "sanity_gate": {"enabled": False},
+            "hppc": {"enabled": False},
+            "timeseries": {
+                "enabled": True,
+                "csv_path": str(csv_path),
+                "period_s": 1.0,
+                "charge_compare": {"enabled": False},
+            },
+            "output_dir": str(output_dir),
+        }
+        cfg_path = self._root / "ecm_timeseries.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertEqual(summary["mode"], "timeseries")
+        self.assertTrue(summary["all_converged"])
+        case = summary["timeseries"]["case"]
+        self.assertTrue(case["converged"])
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        self.assertIn("ocv_v", frame.columns)
+        self.assertFalse(frame.empty)
+
+    def test_lfp_dfn_baseline_smoke(self) -> None:
+        output_dir = self._root / "lfp_baseline_outputs"
+        cfg = {
+            "chemistry": "lfp",
+            "nominal_capacity_ah": 130,
+            "initial_soc": 1.0,
+            "ambient_temp_k": 298.15,
+            "voltage_low_v": 2.5,
+            "voltage_high_v": 3.6,
+            "discharge_rates_c": [0.2],
+            "charge_cc_rate": 0.5,
+            "cv_cutoff_c_rate": 0.05,
+            "rest_min": 1,
+            "period_s": 60,
+            "parameter_set": "Prada2013",
+            "model": {"type": "dfn", "thermal": "isothermal"},
+            "solver": {"rtol": 1e-6, "atol": 1e-8},
+            "sanity_gate": {"enabled": False},
+            "hppc": {"enabled": False},
+            "timeseries": {"enabled": False},
+            "output_dir": str(output_dir),
+        }
+        cfg_path = self._root / "lfp_baseline.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="baseline")
+        self.assertEqual(summary["mode"], "baseline")
+        self.assertEqual(len(summary["cases"]), 1)
+        self.assertTrue(summary["cases"][0]["converged"])
+        audit = json.loads((output_dir / "parameter_audit.json").read_text(encoding="utf-8"))
+        self.assertEqual(audit["parameter_pack"]["chemistry"], "lfp")
+        self.assertEqual(audit["parameter_pack"]["model_type"], "dfn")
+
+
+class TestBenchmarkPipeline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        temp_root = Path.cwd() / ".tmp_tests"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        cls._root = temp_root / f"benchmark_pipeline_{int(time.time() * 1000)}"
+        cls._root.mkdir(parents=True, exist_ok=False)
+
+        cfg = {
+            "chemistry": "nmc",
+            "nominal_capacity_ah": 150,
+            "initial_soc": 1.0,
+            "ambient_temp_k": 298.15,
+            "voltage_low_v": 2.8,
+            "voltage_high_v": 4.2,
+            "discharge_rates_c": [0.2, 1.0],
+            "charge_cc_rate": 0.5,
+            "cv_cutoff_c_rate": 0.05,
+            "rest_min": 5,
+            "period_s": 30,
+            "parameter_set": "Chen2020",
+            "model": {"type": "dfn", "thermal": "isothermal"},
+            "solver": {"rtol": 1e-6, "atol": 1e-8},
+            "quality_gate": {
+                "enabled": True,
+                "min_convergence_rate": 0.95,
+                "max_repeat_delta_final_soc": 5e-4,
+                "max_repeat_delta_min_v": 5e-3,
+                "require_polarization_trend": True,
+                "enforce": True,
+            },
+            "benchmark": {
+                "enabled": True,
+                "rates_c": [0.2, 1.0],
+                "repeats": 2,
+                "profiles": ["dfn_nmc"],
+            },
+            "identification_inputs": {"enabled": False, "strict": True},
+            "termination": {"enabled": True, "logic": "any_of", "must_hit": False, "conditions": []},
+            "sanity_gate": {"enabled": False},
+            "hppc": {"enabled": False},
+            "timeseries": {"enabled": False},
+        }
+
+        cls._output = cls._root / "benchmark_outputs"
+        cfg["output_dir"] = str(cls._output)
+        cls._config_path = cls._root / "benchmark_config.yaml"
+        cls._config_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        cls._summary = run_from_config(cls._config_path, mode="benchmark")
+
+    def test_benchmark_smoke_outputs_and_contract(self) -> None:
+        self.assertTrue((self._output / "summary.json").exists())
+        self.assertTrue((self._output / "benchmark_matrix.csv").exists())
+        self.assertTrue((self._output / "benchmark_summary.json").exists())
+        self.assertTrue((self._output / "benchmark_compare_report.md").exists())
+        self.assertEqual(self._summary["mode"], "benchmark")
+        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertIn("contract_fields", self._summary)
+        self.assertIn("quality_gate", self._summary)
+        self.assertIn("benchmark", self._summary)
+        self.assertIn("identification_inputs_validation", self._summary)
+        self.assertIn("thresholds", self._summary["quality_gate"])
+        benchmark = self._summary["benchmark"]
+        expected = {
+            "passed",
+            "total_cases",
+            "converged_cases",
+            "convergence_rate",
+            "repeatability",
+            "trend_checks",
+            "failures",
+            "artifacts",
+        }
+        self.assertEqual(set(benchmark), expected)
+        self.assertGreaterEqual(benchmark["total_cases"], 2)
+        self.assertGreaterEqual(benchmark["converged_cases"], 1)
+
+    def test_benchmark_quality_gate_failure(self) -> None:
+        cfg = yaml.safe_load(self._config_path.read_text(encoding="utf-8"))
+        fail_output = self._root / "benchmark_gate_fail"
+        cfg["output_dir"] = str(fail_output)
+        cfg["quality_gate"]["min_convergence_rate"] = 1.1
+        fail_cfg_path = self._root / "benchmark_gate_fail.yaml"
+        fail_cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(fail_cfg_path, mode="benchmark")
+        self.assertFalse(summary["quality_gate"]["passed"])
+        self.assertFalse(summary["all_converged"])
+        self.assertGreaterEqual(len(summary["benchmark"]["failures"]), 1)
+        failure = summary["benchmark"]["failures"][0]
+        self.assertEqual(
+            set(failure),
+            {"category", "reason", "profile_id", "rate_c", "repeat", "observed", "threshold"},
+        )
+
+
+class TestIdentificationInputValidation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        temp_root = Path.cwd() / ".tmp_tests"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        cls._root = temp_root / f"ident_inputs_{int(time.time() * 1000)}"
+        cls._root.mkdir(parents=True, exist_ok=False)
+
+        cls._timeseries_csv = cls._root / "timeseries.csv"
+        _write_timeseries_csv(cls._timeseries_csv, duration_s=20.0, period_s=1.0, current_a=10.0, temp_k=298.15)
+        cls._ocv = cls._root / "ocv.csv"
+        pd.DataFrame(
+            {"soc": [0.0, 0.5, 1.0], "ocv_v": [3.0, 3.6, 4.2], "temp_k": [298.15, 298.15, 298.15]}
+        ).to_csv(cls._ocv, index=False)
+        cls._cc = cls._root / "cc.csv"
+        pd.DataFrame(
+            {
+                "time_s": [0.0, 1.0, 2.0],
+                "current_a": [10.0, 10.0, 10.0],
+                "voltage_v": [4.2, 4.19, 4.18],
+                "temp_k": [298.15, 298.15, 298.15],
+            }
+        ).to_csv(cls._cc, index=False)
+        cls._hppc = cls._root / "hppc.csv"
+        pd.DataFrame(
+            {
+                "soc_target": [1.0, 0.5, 0.1],
+                "r_dis_10s_ohm": [0.002, 0.003, 0.004],
+                "r_chg_10s_ohm": [0.0022, 0.0031, 0.0042],
+                "temp_k": [298.15, 298.15, 298.15],
+            }
+        ).to_csv(cls._hppc, index=False)
+
+    def _base_cfg(self, output_dir: Path) -> dict:
+        return {
+            "chemistry": "nmc",
+            "nominal_capacity_ah": 150,
+            "initial_soc": 1.0,
+            "ambient_temp_k": 298.15,
+            "voltage_low_v": 2.8,
+            "voltage_high_v": 4.2,
+            "discharge_rates_c": [0.2, 1.0],
+            "charge_cc_rate": 0.5,
+            "cv_cutoff_c_rate": 0.05,
+            "rest_min": 5,
+            "period_s": 30,
+            "parameter_set": "Chen2020",
+            "model": {"type": "dfn", "thermal": "isothermal"},
+            "solver": {"rtol": 1e-6, "atol": 1e-8},
+            "quality_gate": {"enabled": True, "enforce": True},
+            "benchmark": {"enabled": False},
+            "termination": {"enabled": True, "logic": "any_of", "must_hit": False, "conditions": []},
+            "sanity_gate": {"enabled": False},
+            "hppc": {"enabled": False},
+            "timeseries": {"enabled": True, "csv_path": str(self._timeseries_csv), "charge_compare": {"enabled": False}},
+            "output_dir": str(output_dir),
+        }
+
+    def test_identification_inputs_pass(self) -> None:
+        out = self._root / "ident_ok"
+        cfg = self._base_cfg(out)
+        cfg["identification_inputs"] = {
+            "enabled": True,
+            "strict": True,
+            "ocv_points_csv": str(self._ocv),
+            "cc_cycle_csv": str(self._cc),
+            "hppc_points_csv": str(self._hppc),
+        }
+        cfg_path = self._root / "ident_ok.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        validation = summary["identification_inputs_validation"]
+        self.assertTrue(validation["enabled"])
+        self.assertTrue(validation["passed"])
+
+    def test_identification_inputs_strict_fail(self) -> None:
+        out = self._root / "ident_fail"
+        cfg = self._base_cfg(out)
+        bad_ocv = self._root / "bad_ocv.csv"
+        pd.DataFrame({"soc": [0.0, 0.5, 1.0], "temp_k": [298.15, 298.15, 298.15]}).to_csv(bad_ocv, index=False)
+        cfg["identification_inputs"] = {
+            "enabled": True,
+            "strict": True,
+            "ocv_points_csv": str(bad_ocv),
+            "cc_cycle_csv": str(self._cc),
+            "hppc_points_csv": str(self._hppc),
+        }
+        cfg_path = self._root / "ident_fail.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertFalse(summary["all_converged"])
+        validation = summary["identification_inputs_validation"]
+        self.assertFalse(validation["passed"])
+        self.assertGreaterEqual(len(validation["errors"]), 1)
 
 
 if __name__ == "__main__":

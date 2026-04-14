@@ -20,6 +20,38 @@ _ONE_PIXEL_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y7lvtQAAAAASUVORK5CYII="
 )
 _WARNING_TOKENS = ("infeasible at initial conditions", "skipping step")
+_ALLOWED_MODEL_TYPES = {"dfn", "ecm"}
+_ALLOWED_CHEMISTRY = {"nmc", "lfp"}
+_ALLOWED_THERMAL = {"isothermal", "lumped"}
+_ALLOWED_ECM_RC_ELEMENTS = {1, 2}
+_ALLOWED_TERMINATION_METRICS = {"time_s", "voltage_v", "soc", "current_abs_a", "temperature_k", "ocv_v"}
+_ALLOWED_TERMINATION_OPS = {">=", "<="}
+_CONTRACT_VERSION = "1.1.0"
+_STABLE_SUMMARY_FIELDS = {
+    "contract_version",
+    "contract_fields",
+    "generated_at_utc",
+    "mode",
+    "all_converged",
+    "config",
+    "termination_policy",
+    "termination_hits",
+    "artifacts",
+    "cases",
+}
+_STABLE_CASE_FIELDS = {"case_id", "converged", "runtime_s", "csv_path", "error"}
+_STABLE_QUALITY_GATE_FIELDS = {"enabled", "enforce", "passed", "thresholds", "metrics"}
+_STABLE_BENCHMARK_FIELDS = {
+    "passed",
+    "total_cases",
+    "converged_cases",
+    "convergence_rate",
+    "repeatability",
+    "trend_checks",
+    "failures",
+    "artifacts",
+}
+_STABLE_IDENTIFICATION_FIELDS = {"enabled", "strict", "passed", "datasets", "errors"}
 
 
 @dataclass(frozen=True)
@@ -61,11 +93,87 @@ class TimeseriesSuiteConfig:
     enabled: bool = False
     csv_path: Path | None = None
     period_s: float | None = None
+    use_temp_as_ambient_boundary: bool = False
     charge_compare: ChargeCompareConfig = field(default_factory=ChargeCompareConfig)
 
 
 @dataclass(frozen=True)
+class QualityGateConfig:
+    enabled: bool = True
+    min_convergence_rate: float = 0.95
+    max_repeat_delta_final_soc: float = 5e-4
+    max_repeat_delta_min_v: float = 5e-3
+    require_polarization_trend: bool = True
+    enforce: bool = True
+
+
+@dataclass(frozen=True)
+class IdentificationInputsConfig:
+    enabled: bool = False
+    strict: bool = True
+    ocv_points_csv: Path | None = None
+    cc_cycle_csv: Path | None = None
+    hppc_points_csv: Path | None = None
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    enabled: bool = True
+    rates_c: list[float] = field(default_factory=lambda: [0.2, 1.0])
+    repeats: int = 2
+    rest_min: float = 5.0
+    charge_cc_rate: float = 0.5
+    cv_cutoff_c_rate: float = 0.05
+    period_s: int = 30
+    profiles: list[str] = field(default_factory=lambda: ["dfn_nmc", "dfn_lfp", "ecm_nmc", "ecm_lfp"])
+
+
+@dataclass(frozen=True)
+class TerminationCondition:
+    metric: str
+    op: str
+    threshold: float
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class TerminationConfig:
+    enabled: bool = True
+    logic: str = "any_of"
+    must_hit: bool = False
+    apply_to_experiment_modes: bool = True
+    conditions: list[TerminationCondition] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TerminationResult:
+    hit: bool
+    reason: str | None
+    time_s: float | None
+    index: int | None
+    metric: str | None
+    op: str | None
+    threshold: float | None
+    value: float | None
+
+
+def _default_termination_result() -> TerminationResult:
+    return TerminationResult(
+        hit=False,
+        reason=None,
+        time_s=None,
+        index=None,
+        metric=None,
+        op=None,
+        threshold=None,
+        value=None,
+    )
+
+
+@dataclass(frozen=True)
 class Config:
+    model_type: str
+    chemistry: str
     nominal_capacity_ah: float
     initial_soc: float
     ambient_temp_k: float
@@ -78,12 +186,18 @@ class Config:
     output_dir: Path
     parameter_set: str = "Chen2020"
     thermal: str = "isothermal"
+    ecm_rc_elements: int = 1
+    ecm_fitted_pack_json: Path | None = None
     period_s: int = 30
     solver_rtol: float = 1e-6
     solver_atol: float = 1e-8
     sanity_gate: SanityGateConfig = field(default_factory=SanityGateConfig)
     hppc: HppcConfig = field(default_factory=HppcConfig)
     timeseries: TimeseriesSuiteConfig = field(default_factory=TimeseriesSuiteConfig)
+    quality_gate: QualityGateConfig = field(default_factory=QualityGateConfig)
+    identification_inputs: IdentificationInputsConfig = field(default_factory=IdentificationInputsConfig)
+    benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+    termination: TerminationConfig = field(default_factory=TerminationConfig)
 
 
 @dataclass(frozen=True)
@@ -95,6 +209,7 @@ class RunSummary:
     final_soc: float | None
     runtime_s: float
     csv_path: str | None
+    termination: TerminationResult = field(default_factory=_default_termination_result)
     error: str | None = None
 
 
@@ -127,6 +242,7 @@ class HppcPointResult:
     has_negative_current: bool
     csv_path: str | None
     warning_messages: list[str]
+    termination: TerminationResult = field(default_factory=_default_termination_result)
     error: str | None = None
 
 
@@ -143,6 +259,7 @@ class ChargeCompareCaseResult:
     cc_end_time_s: float | None
     cv_time_s: float | None
     csv_path: str | None
+    termination: TerminationResult = field(default_factory=_default_termination_result)
     error: str | None = None
 
 
@@ -163,17 +280,223 @@ def _dedupe_messages(messages: list[str]) -> list[str]:
     return deduped
 
 
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
+def _config_to_summary_dict(config: Config) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    return _to_jsonable(payload)
+
+
+def _infer_parameter_quality_level(parameter_set: str) -> str:
+    token = str(parameter_set).strip().lower()
+    identified_tokens = ("identified", "fitted", "calibrated", "measured")
+    return "identified" if any(item in token for item in identified_tokens) else "proxy"
+
+
+def _resolve_parameter_quality_level(config: Config) -> str:
+    if config.model_type == "ecm" and config.ecm_fitted_pack_json is not None:
+        return "identified"
+    return _infer_parameter_quality_level(config.parameter_set)
+
+
+def _proxy_parameter_warning(config: Config) -> str | None:
+    quality_level = _resolve_parameter_quality_level(config)
+    if quality_level != "proxy":
+        return None
+    if config.model_type == "ecm" and config.chemistry == "lfp":
+        return (
+            "Proxy parameter pack in use for ECM+LFP profile; "
+            "results are workflow-grade and not lab-calibrated."
+        )
+    if config.chemistry == "lfp":
+        return "Proxy parameter pack in use for LFP chemistry; results are workflow-grade and not lab-calibrated."
+    return "Proxy parameter pack in use; results are for relative comparison and reproducibility only."
+
+
+def _contract_fields_descriptor(mode: str) -> dict[str, Any]:
+    mode_specific = {
+        "baseline": ["sanity_gate"],
+        "hppc": ["hppc"],
+        "timeseries": ["timeseries|charge_compare"],
+        "benchmark": ["quality_gate", "benchmark"],
+    }
+    return {
+        "stable_top_level_fields": sorted(_STABLE_SUMMARY_FIELDS),
+        "mode_required_blocks": mode_specific.get(mode, []),
+        "extensible_top_level_fields": ["warnings", "identification_inputs_validation"],
+        "stable_case_fields": sorted(_STABLE_CASE_FIELDS),
+        "extensible_case_fields": ["min_v", "max_v", "final_soc", "termination"],
+        "stable_block_fields": {
+            "quality_gate": sorted(_STABLE_QUALITY_GATE_FIELDS),
+            "benchmark": sorted(_STABLE_BENCHMARK_FIELDS),
+            "identification_inputs_validation": sorted(_STABLE_IDENTIFICATION_FIELDS),
+        },
+    }
+
+
+def _attach_contract_metadata(summary: dict[str, Any]) -> None:
+    mode = str(summary.get("mode", ""))
+    summary["contract_version"] = _CONTRACT_VERSION
+    summary["contract_fields"] = _contract_fields_descriptor(mode)
+
+
+def _validate_summary_contract(summary: dict[str, Any]) -> None:
+    missing_top = sorted(_STABLE_SUMMARY_FIELDS - set(summary.keys()))
+    if missing_top:
+        raise ValueError(f"summary contract missing top-level fields: {missing_top}")
+    if not isinstance(summary.get("cases"), list):
+        raise ValueError("summary.cases must be a list.")
+
+    mode = str(summary.get("mode", ""))
+    if mode == "baseline" and "sanity_gate" not in summary:
+        raise ValueError("baseline summary must include sanity_gate.")
+    if mode == "hppc" and "hppc" not in summary:
+        raise ValueError("hppc summary must include hppc block.")
+    if mode == "benchmark" and ("quality_gate" not in summary or "benchmark" not in summary):
+        raise ValueError("benchmark summary must include quality_gate and benchmark blocks.")
+    if mode == "timeseries" and ("timeseries" not in summary and "charge_compare" not in summary):
+        raise ValueError("timeseries summary must include timeseries or charge_compare block.")
+
+    for idx, case in enumerate(summary["cases"]):
+        if not isinstance(case, dict):
+            raise ValueError(f"summary.cases[{idx}] must be an object.")
+        missing_case = sorted(_STABLE_CASE_FIELDS - set(case.keys()))
+        if missing_case:
+            raise ValueError(f"summary.cases[{idx}] missing fields: {missing_case}")
+        if "termination" in case:
+            term = case["termination"]
+            if not isinstance(term, dict):
+                raise ValueError(f"summary.cases[{idx}].termination must be an object.")
+            expected_term = {"hit", "reason", "time_s", "index", "metric", "op", "threshold", "value"}
+            missing_term = sorted(expected_term - set(term.keys()))
+            if missing_term:
+                raise ValueError(f"summary.cases[{idx}].termination missing fields: {missing_term}")
+
+    if "quality_gate" in summary:
+        payload = summary["quality_gate"]
+        if not isinstance(payload, dict):
+            raise ValueError("summary.quality_gate must be an object.")
+        missing = sorted(_STABLE_QUALITY_GATE_FIELDS - set(payload.keys()))
+        if missing:
+            raise ValueError(f"summary.quality_gate missing fields: {missing}")
+
+    if "benchmark" in summary:
+        payload = summary["benchmark"]
+        if not isinstance(payload, dict):
+            raise ValueError("summary.benchmark must be an object.")
+        missing = sorted(_STABLE_BENCHMARK_FIELDS - set(payload.keys()))
+        if missing:
+            raise ValueError(f"summary.benchmark missing fields: {missing}")
+        failures = payload.get("failures", [])
+        if not isinstance(failures, list):
+            raise ValueError("summary.benchmark.failures must be a list.")
+        for idx, failure in enumerate(failures):
+            if not isinstance(failure, dict):
+                raise ValueError(f"summary.benchmark.failures[{idx}] must be an object.")
+            required = {"category", "reason", "profile_id", "rate_c", "repeat", "observed", "threshold"}
+            missing_failure = sorted(required - set(failure.keys()))
+            if missing_failure:
+                raise ValueError(f"summary.benchmark.failures[{idx}] missing fields: {missing_failure}")
+
+    if "identification_inputs_validation" in summary:
+        payload = summary["identification_inputs_validation"]
+        if not isinstance(payload, dict):
+            raise ValueError("summary.identification_inputs_validation must be an object.")
+        missing = sorted(_STABLE_IDENTIFICATION_FIELDS - set(payload.keys()))
+        if missing:
+            raise ValueError(f"summary.identification_inputs_validation missing fields: {missing}")
+
+
+def _write_summary_json(output_dir: Path, summary: dict[str, Any]) -> None:
+    _attach_contract_metadata(summary)
+    _validate_summary_contract(summary)
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
 def _warning_is_infeasible(message: str) -> bool:
     lower = message.lower()
     return any(token in lower for token in _WARNING_TOKENS)
+
+
+def _should_retry_with_casadi(config: Config, error: str | None) -> bool:
+    if config.model_type not in {"dfn", "ecm"} or not error:
+        return False
+    token = str(error).lower()
+    return (
+        "ida_err_fail" in token
+        or "error test failures occurred too many times" in token
+        or "minimum step size was reached" in token
+    )
 
 
 def _case_id(rate_c: float) -> str:
     return f"case_{str(rate_c).replace('.', 'p')}c"
 
 
+def _rate_from_case_id(case_id: str) -> float | None:
+    if not case_id.startswith("case_") or not case_id.endswith("c"):
+        return None
+    token = case_id[5:-1].replace("p", ".")
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
 def _soc_label(soc: float) -> str:
     return f"{int(round(soc * 100)):03d}"
+
+
+def _uses_initial_soc_argument(config: Config) -> bool:
+    return config.model_type == "dfn"
+
+
+def _build_core_model(config: Config) -> pybamm.BaseModel:
+    if config.model_type == "dfn":
+        return pybamm.lithium_ion.DFN(options={"thermal": config.thermal})
+    if config.model_type == "ecm":
+        return pybamm.equivalent_circuit.Thevenin(
+            options={"number of rc elements": config.ecm_rc_elements}
+        )
+    raise ValueError(f"Unsupported model_type: {config.model_type}")
+
+
+def _effective_initial_soc(config: Config, initial_soc: float) -> float:
+    soc = float(initial_soc)
+    if config.model_type == "ecm":
+        # Thevenin event checks can fail at exactly 0/1 SOC. Keep a tiny safety margin.
+        return float(np.clip(soc, 1e-8, 1.0 - 1e-8))
+    return soc
+
+
+def _set_initial_soc_if_supported(
+    parameter_values: pybamm.ParameterValues, initial_soc: float
+) -> pybamm.ParameterValues:
+    updated = parameter_values.copy()
+    if "Initial SoC" in updated.keys():
+        updated.update({"Initial SoC": float(initial_soc)})
+    return updated
+
+
+def _resolve_optional_path(raw_value: Any, base_dir: Path) -> Path | None:
+    if not isinstance(raw_value, str):
+        return None
+    token = raw_value.strip()
+    if not token:
+        return None
+    candidate = Path(token)
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    return candidate
 
 
 def load_config(config_path: str | Path) -> Config:
@@ -184,18 +507,38 @@ def load_config(config_path: str | Path) -> Config:
         raise ValueError("Config file is empty")
 
     solver = raw.get("solver", {})
-    model = raw.get("model", {})
+    model_raw = raw.get("model", {})
     sanity_raw = raw.get("sanity_gate", {})
     hppc_raw = raw.get("hppc", {})
     timeseries_raw = raw.get("timeseries", {})
+    termination_raw = raw.get("termination", {})
+    quality_gate_raw = raw.get("quality_gate", {})
+    benchmark_raw = raw.get("benchmark", {})
+    identification_raw = raw.get("identification_inputs", {})
 
-    timeseries_csv_raw = timeseries_raw.get("csv_path")
-    timeseries_csv_path: Path | None = None
-    if isinstance(timeseries_csv_raw, str) and timeseries_csv_raw.strip():
-        candidate = Path(timeseries_csv_raw.strip())
-        if not candidate.is_absolute():
-            candidate = (config_path.parent / candidate).resolve()
-        timeseries_csv_path = candidate
+    model_type = str(model_raw.get("type", "dfn")).strip().lower()
+    if model_type not in _ALLOWED_MODEL_TYPES:
+        raise ValueError(f"model.type must be one of {sorted(_ALLOWED_MODEL_TYPES)}")
+
+    chemistry = str(raw.get("chemistry", "nmc")).strip().lower()
+    if chemistry not in _ALLOWED_CHEMISTRY:
+        raise ValueError(f"chemistry must be one of {sorted(_ALLOWED_CHEMISTRY)}")
+
+    thermal = str(model_raw.get("thermal", "isothermal")).strip().lower()
+    if thermal not in _ALLOWED_THERMAL:
+        raise ValueError(f"model.thermal must be one of {sorted(_ALLOWED_THERMAL)}")
+    try:
+        ecm_rc_elements = int(model_raw.get("ecm_rc_elements", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model.ecm_rc_elements must be an integer.") from exc
+    if ecm_rc_elements not in _ALLOWED_ECM_RC_ELEMENTS:
+        raise ValueError(f"model.ecm_rc_elements must be one of {sorted(_ALLOWED_ECM_RC_ELEMENTS)}")
+
+    timeseries_csv_path = _resolve_optional_path(timeseries_raw.get("csv_path"), config_path.parent)
+    ecm_fitted_pack_path = _resolve_optional_path(model_raw.get("ecm_fitted_pack_json"), config_path.parent)
+    ocv_points_path = _resolve_optional_path(identification_raw.get("ocv_points_csv"), config_path.parent)
+    cc_cycle_path = _resolve_optional_path(identification_raw.get("cc_cycle_csv"), config_path.parent)
+    hppc_points_path = _resolve_optional_path(identification_raw.get("hppc_points_csv"), config_path.parent)
 
     charge_compare_raw = timeseries_raw.get("charge_compare", {})
     rates_raw = charge_compare_raw.get("rates_c", [0.1, 1.0 / 3.0, 1.0])
@@ -205,8 +548,48 @@ def load_config(config_path: str | Path) -> Config:
         {0.1: 1.0, 1.0 / 3.0: 0.1, 1.0: 0.1},
     )
     period_by_rate_s = {float(rate_key): float(period_value) for rate_key, period_value in period_by_rate_raw.items()}
+    benchmark_rates = [float(rate) for rate in benchmark_raw.get("rates_c", [0.2, 1.0])]
+    benchmark_profiles = [str(item).strip().lower() for item in benchmark_raw.get(
+        "profiles", ["dfn_nmc", "dfn_lfp", "ecm_nmc", "ecm_lfp"]
+    )]
+    if not benchmark_rates or any(rate <= 0 for rate in benchmark_rates):
+        raise ValueError("benchmark.rates_c must contain positive C-rates.")
+    benchmark_repeats = int(benchmark_raw.get("repeats", 2))
+    if benchmark_repeats < 1:
+        raise ValueError("benchmark.repeats must be >= 1.")
+    if not benchmark_profiles:
+        raise ValueError("benchmark.profiles must not be empty.")
+
+    logic = str(termination_raw.get("logic", "any_of")).strip().lower()
+    if logic != "any_of":
+        raise ValueError("termination.logic currently supports only 'any_of'.")
+
+    conditions: list[TerminationCondition] = []
+    for index, condition_raw in enumerate(termination_raw.get("conditions", [])):
+        if not isinstance(condition_raw, dict):
+            raise ValueError(f"termination.conditions[{index}] must be a mapping.")
+        try:
+            metric = str(condition_raw["metric"]).strip()
+            op = str(condition_raw["op"]).strip()
+            threshold = float(condition_raw["threshold"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"termination.conditions[{index}] requires metric/op/threshold with numeric threshold."
+            ) from exc
+        name_raw = condition_raw.get("name")
+        name = None if name_raw is None else str(name_raw)
+        conditions.append(
+            TerminationCondition(
+                metric=metric,
+                op=op,
+                threshold=threshold,
+                name=name,
+            )
+        )
 
     return Config(
+        model_type=model_type,
+        chemistry=chemistry,
         nominal_capacity_ah=float(raw["nominal_capacity_ah"]),
         initial_soc=float(raw["initial_soc"]),
         ambient_temp_k=float(raw["ambient_temp_k"]),
@@ -218,7 +601,9 @@ def load_config(config_path: str | Path) -> Config:
         rest_min=float(raw["rest_min"]),
         output_dir=Path(raw["output_dir"]),
         parameter_set=str(raw.get("parameter_set", "Chen2020")),
-        thermal=str(model.get("thermal", "isothermal")),
+        thermal=thermal,
+        ecm_rc_elements=ecm_rc_elements,
+        ecm_fitted_pack_json=ecm_fitted_pack_path,
         period_s=int(raw.get("period_s", 30)),
         solver_rtol=float(solver.get("rtol", 1e-6)),
         solver_atol=float(solver.get("atol", 1e-8)),
@@ -244,6 +629,7 @@ def load_config(config_path: str | Path) -> Config:
             enabled=bool(timeseries_raw.get("enabled", False)),
             csv_path=timeseries_csv_path,
             period_s=float(timeseries_raw["period_s"]) if "period_s" in timeseries_raw else None,
+            use_temp_as_ambient_boundary=bool(timeseries_raw.get("use_temp_as_ambient_boundary", False)),
             charge_compare=ChargeCompareConfig(
                 enabled=bool(charge_compare_raw.get("enabled", False)),
                 soc_start=float(charge_compare_raw.get("soc_start", 0.0)),
@@ -252,6 +638,38 @@ def load_config(config_path: str | Path) -> Config:
                 cv_cutoff_c_rate=float(charge_compare_raw.get("cv_cutoff_c_rate", 0.05)),
                 voltage_high_v=float(charge_compare_raw.get("voltage_high_v", 4.2)),
             ),
+        ),
+        quality_gate=QualityGateConfig(
+            enabled=bool(quality_gate_raw.get("enabled", True)),
+            min_convergence_rate=float(quality_gate_raw.get("min_convergence_rate", 0.95)),
+            max_repeat_delta_final_soc=float(quality_gate_raw.get("max_repeat_delta_final_soc", 5e-4)),
+            max_repeat_delta_min_v=float(quality_gate_raw.get("max_repeat_delta_min_v", 5e-3)),
+            require_polarization_trend=bool(quality_gate_raw.get("require_polarization_trend", True)),
+            enforce=bool(quality_gate_raw.get("enforce", True)),
+        ),
+        identification_inputs=IdentificationInputsConfig(
+            enabled=bool(identification_raw.get("enabled", False)),
+            strict=bool(identification_raw.get("strict", True)),
+            ocv_points_csv=ocv_points_path,
+            cc_cycle_csv=cc_cycle_path,
+            hppc_points_csv=hppc_points_path,
+        ),
+        benchmark=BenchmarkConfig(
+            enabled=bool(benchmark_raw.get("enabled", True)),
+            rates_c=benchmark_rates,
+            repeats=benchmark_repeats,
+            rest_min=float(benchmark_raw.get("rest_min", 5.0)),
+            charge_cc_rate=float(benchmark_raw.get("charge_cc_rate", 0.5)),
+            cv_cutoff_c_rate=float(benchmark_raw.get("cv_cutoff_c_rate", 0.05)),
+            period_s=int(benchmark_raw.get("period_s", 30)),
+            profiles=benchmark_profiles,
+        ),
+        termination=TerminationConfig(
+            enabled=bool(termination_raw.get("enabled", True)),
+            logic=logic,
+            must_hit=bool(termination_raw.get("must_hit", False)),
+            apply_to_experiment_modes=bool(termination_raw.get("apply_to_experiment_modes", True)),
+            conditions=conditions,
         ),
     )
 
@@ -267,7 +685,7 @@ def _extract_series(solution: pybamm.Solution, names: list[str]) -> np.ndarray:
 
 def _extract_soc(solution: pybamm.Solution, config: Config, initial_soc: float | None = None) -> np.ndarray:
     try:
-        return _extract_series(solution, ["State of Charge", "X-averaged cell SOC"])
+        return _extract_series(solution, ["State of Charge", "X-averaged cell SOC", "SoC"])
     except KeyError:
         discharge_ah = _extract_series(solution, ["Discharge capacity [A.h]"])
         origin_soc = config.initial_soc if initial_soc is None else initial_soc
@@ -291,7 +709,11 @@ def _extract_temperature(solution: pybamm.Solution, config: Config, size: int) -
 def _solution_to_frame(solution: pybamm.Solution, config: Config, initial_soc: float | None = None) -> pd.DataFrame:
     time_s = _extract_series(solution, ["Time [s]"])
     current_a = _extract_series(solution, ["Current [A]"])
-    voltage_v = _extract_series(solution, ["Terminal voltage [V]"])
+    voltage_v = _extract_series(solution, ["Terminal voltage [V]", "Battery voltage [V]", "Voltage [V]"])
+    try:
+        ocv_v = _extract_series(solution, ["Open-circuit voltage [V]", "Battery open-circuit voltage [V]"])
+    except KeyError:
+        ocv_v = np.full(len(time_s), np.nan)
     soc = _extract_soc(solution, config, initial_soc=initial_soc)
     temp_k = _extract_temperature(solution, config, len(time_s))
     return pd.DataFrame(
@@ -299,6 +721,7 @@ def _solution_to_frame(solution: pybamm.Solution, config: Config, initial_soc: f
             "time_s": time_s,
             "current_a": current_a,
             "voltage_v": voltage_v,
+            "ocv_v": ocv_v,
             "soc": soc,
             "temperature_k": temp_k,
         }
@@ -325,6 +748,97 @@ def _validate_timeseries_frame(profile: pd.DataFrame) -> pd.DataFrame:
     if np.any(np.diff(times) <= 0):
         raise ValueError("Timeseries time_s must be strictly increasing.")
     return cleaned
+
+
+def _validate_termination_config(termination: TerminationConfig) -> None:
+    if termination.logic != "any_of":
+        raise ValueError("termination.logic currently supports only 'any_of'.")
+    for index, condition in enumerate(termination.conditions):
+        if condition.metric not in _ALLOWED_TERMINATION_METRICS:
+            raise ValueError(
+                f"termination.conditions[{index}].metric must be one of {sorted(_ALLOWED_TERMINATION_METRICS)}"
+            )
+        if condition.op not in _ALLOWED_TERMINATION_OPS:
+            raise ValueError(
+                f"termination.conditions[{index}].op must be one of {sorted(_ALLOWED_TERMINATION_OPS)}"
+            )
+        if not np.isfinite(condition.threshold):
+            raise ValueError(f"termination.conditions[{index}].threshold must be finite.")
+
+
+def _termination_values(frame: pd.DataFrame, metric: str) -> np.ndarray:
+    if metric == "current_abs_a":
+        return np.abs(frame["current_a"].to_numpy(dtype=float))
+    if metric not in frame.columns:
+        raise ValueError(f"Termination metric '{metric}' is not available in output frame.")
+    return frame[metric].to_numpy(dtype=float)
+
+
+def _first_hit_index(values: np.ndarray, op: str, threshold: float) -> int | None:
+    if op == ">=":
+        indices = np.where(values >= threshold)[0]
+    elif op == "<=":
+        indices = np.where(values <= threshold)[0]
+    else:
+        raise ValueError(f"Unsupported termination op: {op}")
+    if indices.size == 0:
+        return None
+    return int(indices[0])
+
+
+def _apply_termination(
+    frame: pd.DataFrame, termination: TerminationConfig
+) -> tuple[pd.DataFrame, TerminationResult, str | None]:
+    if not termination.enabled or not termination.conditions:
+        return frame, _default_termination_result(), None
+
+    _validate_termination_config(termination)
+    if frame.empty:
+        message = "No data points available for termination evaluation."
+        result = _default_termination_result()
+        result = replace(result, reason=message)
+        if termination.must_hit:
+            return frame, result, message
+        return frame, result, None
+
+    hits: list[tuple[int, int, TerminationCondition, float]] = []
+    for condition_index, condition in enumerate(termination.conditions):
+        values = _termination_values(frame, condition.metric)
+        hit_index = _first_hit_index(values, condition.op, condition.threshold)
+        if hit_index is None:
+            continue
+        hits.append((hit_index, condition_index, condition, float(values[hit_index])))
+
+    if not hits:
+        message = "No termination condition was met."
+        result = _default_termination_result()
+        result = replace(result, reason=message)
+        if termination.must_hit:
+            return frame, result, message
+        return frame, result, None
+
+    hit_index, _, condition, value = min(hits, key=lambda item: (item[0], item[1]))
+    hit_time = float(frame["time_s"].iloc[hit_index])
+    reason = condition.name or f"{condition.metric} {condition.op} {condition.threshold}"
+    result = TerminationResult(
+        hit=True,
+        reason=reason,
+        time_s=hit_time,
+        index=hit_index,
+        metric=condition.metric,
+        op=condition.op,
+        threshold=condition.threshold,
+        value=value,
+    )
+    return frame.iloc[: hit_index + 1].copy(), result, None
+
+
+def _apply_termination_with_context(
+    frame: pd.DataFrame, config: Config, *, context_mode: str
+) -> tuple[pd.DataFrame, TerminationResult, str | None]:
+    if context_mode in {"baseline", "charge_compare"} and not config.termination.apply_to_experiment_modes:
+        return frame, _default_termination_result(), None
+    return _apply_termination(frame, config.termination)
 
 
 def _build_hppc_profile(config: Config) -> pd.DataFrame:
@@ -426,31 +940,148 @@ def _build_charge_compare_experiment(rate_c: float, voltage_high_v: float, cv_cu
     return pybamm.Experiment(steps, period=f"{period_s} seconds")
 
 
+def _load_ecm_fitted_pack(path: Path) -> tuple[int, dict[str, np.ndarray]]:
+    if not path.exists():
+        raise FileNotFoundError(f"ECM fitted pack not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    order_raw = payload.get("ecm_order")
+    if order_raw is None:
+        model_name = str(payload.get("model", "")).strip().lower()
+        ecm_order = 2 if "2rc" in model_name else 1
+    else:
+        try:
+            ecm_order = int(order_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ECM fitted pack field 'ecm_order' must be an integer.") from exc
+    if ecm_order not in _ALLOWED_ECM_RC_ELEMENTS:
+        raise ValueError(f"ECM fitted pack field 'ecm_order' must be one of {sorted(_ALLOWED_ECM_RC_ELEMENTS)}.")
+
+    required = {"soc", "ocv_v", "r0_ohm", "r1_ohm", "c1_f"}
+    if ecm_order == 2:
+        required |= {"r2_ohm", "c2_f"}
+    missing = sorted(required - set(payload.keys()))
+    if missing:
+        raise ValueError(f"ECM fitted pack missing fields: {missing}")
+
+    arrays: dict[str, np.ndarray] = {}
+    for key in sorted(required):
+        values = np.asarray(payload[key], dtype=float)
+        if values.ndim != 1 or values.size < 2:
+            raise ValueError(f"ECM fitted pack field '{key}' must be a 1-D array with at least two points.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"ECM fitted pack field '{key}' contains non-finite values.")
+        arrays[key] = values
+
+    lengths = {name: arr.size for name, arr in arrays.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"ECM fitted pack arrays must share the same length, got {lengths}.")
+
+    soc = arrays["soc"]
+    if np.any(np.diff(soc) <= 0):
+        raise ValueError("ECM fitted pack 'soc' must be strictly increasing.")
+    if np.min(soc) < -1e-12 or np.max(soc) > 1.0 + 1e-12:
+        raise ValueError("ECM fitted pack 'soc' must stay within [0, 1].")
+    if np.any(arrays["r0_ohm"] <= 0) or np.any(arrays["r1_ohm"] <= 0) or np.any(arrays["c1_f"] <= 0):
+        raise ValueError("ECM fitted pack resistance/capacitance values must be positive.")
+    if ecm_order == 2 and (np.any(arrays["r2_ohm"] <= 0) or np.any(arrays["c2_f"] <= 0)):
+        raise ValueError("ECM fitted pack second RC resistance/capacitance values must be positive.")
+    return ecm_order, arrays
+
+
+def _apply_ecm_fitted_pack(values: pybamm.ParameterValues, pack_path: Path, *, ecm_rc_elements: int) -> None:
+    pack_order, arrays = _load_ecm_fitted_pack(pack_path)
+    if pack_order != ecm_rc_elements:
+        raise ValueError(
+            f"ECM fitted pack order mismatch: pack ecm_order={pack_order}, "
+            f"but config model.ecm_rc_elements={ecm_rc_elements}."
+        )
+    soc_axis = arrays["soc"]
+    soc_min = float(soc_axis[0])
+    soc_max = float(soc_axis[-1])
+
+    def _soc_interpolant(target: pybamm.Symbol, data: np.ndarray, name: str) -> pybamm.Symbol:
+        return pybamm.Interpolant(soc_axis, data, target, name=name)
+
+    def _clamp_soc(target: pybamm.Symbol) -> pybamm.Symbol:
+        # HPPC low-SOC points can briefly drive SOC outside fitted-pack support.
+        # Clamp to pack bounds to avoid unstable extrapolation near 0%/100%.
+        return pybamm.maximum(pybamm.Scalar(soc_min), pybamm.minimum(target, pybamm.Scalar(soc_max)))
+
+    def ocv_fn(sto: pybamm.Symbol) -> pybamm.Symbol:
+        return _soc_interpolant(_clamp_soc(sto), arrays["ocv_v"], "ecm_fitted_ocv")
+
+    def r0_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _soc_interpolant(_clamp_soc(soc), arrays["r0_ohm"], "ecm_fitted_r0")
+
+    def r1_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _soc_interpolant(_clamp_soc(soc), arrays["r1_ohm"], "ecm_fitted_r1")
+
+    def c1_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _soc_interpolant(_clamp_soc(soc), arrays["c1_f"], "ecm_fitted_c1")
+
+    updates: dict[str, Any] = {
+        "Open-circuit voltage [V]": ocv_fn,
+        "R0 [Ohm]": r0_fn,
+        "R1 [Ohm]": r1_fn,
+        "C1 [F]": c1_fn,
+    }
+    if pack_order == 2:
+        def r2_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+            return _soc_interpolant(_clamp_soc(soc), arrays["r2_ohm"], "ecm_fitted_r2")
+
+        def c2_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+            return _soc_interpolant(_clamp_soc(soc), arrays["c2_f"], "ecm_fitted_c2")
+
+        updates["R2 [Ohm]"] = r2_fn
+        updates["C2 [F]"] = c2_fn
+        updates["Element-2 initial overpotential [V]"] = 0.0
+    values.update(updates)
+
+
 def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dict[str, float]]:
     values = pybamm.ParameterValues(config.parameter_set)
-    base_nominal = float(values["Nominal cell capacity [A.h]"])
+    capacity_key = None
+    for key in ["Nominal cell capacity [A.h]", "Cell capacity [A.h]"]:
+        if key in values.keys():
+            capacity_key = key
+            break
+    if capacity_key is None:
+        raise ValueError("Parameter set must define either 'Nominal cell capacity [A.h]' or 'Cell capacity [A.h]'.")
+
+    base_nominal = float(values[capacity_key])
     if base_nominal <= 0:
         raise ValueError("Base nominal cell capacity must be positive.")
 
-    try:
-        base_parallel = float(values["Number of electrodes connected in parallel to make a cell"])
-    except KeyError:
-        base_parallel = 1.0
+    parallel_key = "Number of electrodes connected in parallel to make a cell"
+    has_parallel = parallel_key in values.keys()
+    base_parallel = float(values[parallel_key]) if has_parallel else 1.0
 
     ratio = config.nominal_capacity_ah / base_nominal
     parallel_after = base_parallel * ratio
-    values.update(
-        {
-            "Nominal cell capacity [A.h]": config.nominal_capacity_ah,
-            "Number of electrodes connected in parallel to make a cell": parallel_after,
-            "Ambient temperature [K]": config.ambient_temp_k,
-            "Initial temperature [K]": config.ambient_temp_k,
-        }
-    )
+    updates: dict[str, Any] = {
+        capacity_key: config.nominal_capacity_ah,
+    }
+    if has_parallel and config.model_type == "dfn":
+        updates[parallel_key] = parallel_after
+    elif has_parallel:
+        updates[parallel_key] = base_parallel
+    if "Ambient temperature [K]" in values.keys():
+        updates["Ambient temperature [K]"] = config.ambient_temp_k
+    if "Initial temperature [K]" in values.keys():
+        updates["Initial temperature [K]"] = config.ambient_temp_k
+    if "Initial SoC" in values.keys():
+        updates["Initial SoC"] = _effective_initial_soc(config, config.initial_soc)
+    values.update(updates)
+    if config.model_type == "ecm" and config.ecm_fitted_pack_json is not None:
+        _apply_ecm_fitted_pack(values, config.ecm_fitted_pack_json, ecm_rc_elements=config.ecm_rc_elements)
     scaling = {
+        "model_type": config.model_type,
+        "chemistry": config.chemistry,
+        "capacity_parameter": capacity_key,
         "base_nominal_capacity_ah": base_nominal,
         "target_nominal_capacity_ah": config.nominal_capacity_ah,
         "scale_ratio": ratio,
+        "parallel_parameter_present": float(has_parallel),
         "parallel_before": base_parallel,
         "parallel_after": parallel_after,
     }
@@ -459,41 +1090,211 @@ def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dic
 
 def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, float]) -> Path:
     audit_path = output_dir / "parameter_audit.json"
-    audit = {
-        "base_parameter_set": config.parameter_set,
-        "scaling": scaling,
-        "scaled": [
-            {
-                "parameter": "Nominal cell capacity [A.h]",
-                "base_value": scaling["base_nominal_capacity_ah"],
-                "target_value": scaling["target_nominal_capacity_ah"],
-                "migration_tag": "scaled_from_reference_cell",
-            },
+    quality_level = _resolve_parameter_quality_level(config)
+    scaled_entries = [
+        {
+            "parameter": scaling["capacity_parameter"],
+            "base_value": scaling["base_nominal_capacity_ah"],
+            "target_value": scaling["target_nominal_capacity_ah"],
+            "migration_tag": "scaled_from_reference_cell",
+        }
+    ]
+    if bool(scaling["parallel_parameter_present"]):
+        scaled_entries.append(
             {
                 "parameter": "Number of electrodes connected in parallel to make a cell",
                 "base_value": scaling["parallel_before"],
                 "target_value": scaling["parallel_after"],
-                "migration_tag": "parallel_count_scaled_with_capacity",
-            },
-        ],
-        "reused": [
-            "Electrolyte transport and kinetic baseline from Chen2020",
-            "Default DFN structure and domain assumptions from PyBaMM",
-        ],
-        "pending_identification": [
+                "migration_tag": "parallel_count_scaled_with_capacity"
+                if config.model_type == "dfn"
+                else "parallel_count_kept_for_model_compatibility",
+            }
+        )
+
+    if config.chemistry == "lfp":
+        pending_identification = [
+            "LFP OCP fit under target temperature window",
+            "Rate-dependent resistance and diffusion calibration via HPPC",
+            "Cell-specific thermal behavior and heat transfer coefficients",
+        ]
+    else:
+        pending_identification = [
             "NMC622-specific OCP fit",
             "NMC622 reaction-rate constants over SOC/temperature",
             "Cell-specific thermal behavior and heat transfer coefficients",
             "Rate-dependent resistance and diffusion calibration via HPPC",
-        ],
-        "disclaimer": "Proxy parameters for baseline simulation only; absolute accuracy is not yet claimed.",
+        ]
+
+    if config.model_type == "ecm":
+        reused = [
+            "Equivalent-circuit structure (Thevenin) and default ECM parameters from PyBaMM",
+        ]
+    else:
+        reused = [
+            f"Electrolyte transport and kinetic baseline from {config.parameter_set}",
+            "Default DFN structure and domain assumptions from PyBaMM",
+        ]
+
+    disclaimer = (
+        "Proxy parameters for baseline simulation only; absolute accuracy is not yet claimed."
+        if quality_level == "proxy"
+        else "Identified ECM fitted pack in use; results are calibrated against DFN reference curves."
+    )
+    audit = {
+        "base_parameter_set": config.parameter_set,
+        "parameter_pack": {
+            "model_type": config.model_type,
+            "chemistry": config.chemistry,
+            "source": "PyBaMM bundled parameter set",
+            "version": pybamm.__version__,
+            "quality_level": quality_level,
+            "ecm_rc_elements": config.ecm_rc_elements if config.model_type == "ecm" else None,
+            "migration_tag": "identified_pack_for_simulation"
+            if quality_level == "identified"
+            else "proxy_pack_for_baseline_simulation",
+            "fitted_pack_json": str(config.ecm_fitted_pack_json) if config.ecm_fitted_pack_json is not None else None,
+        },
+        "scaling": scaling,
+        "scaled": scaled_entries,
+        "reused": reused,
+        "pending_identification": pending_identification,
+        "disclaimer": disclaimer,
     }
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     return audit_path
 
 
 def _write_empty_timeseries(csv_path: Path) -> None:
-    pd.DataFrame(columns=["time_s", "current_a", "voltage_v", "soc", "temperature_k"]).to_csv(csv_path, index=False)
+    pd.DataFrame(columns=["time_s", "current_a", "voltage_v", "ocv_v", "soc", "temperature_k"]).to_csv(
+        csv_path, index=False
+    )
+
+
+def _strictly_monotonic(values: np.ndarray) -> bool:
+    if values.size < 2:
+        return True
+    return bool(np.all(np.diff(values) > 0) or np.all(np.diff(values) < 0))
+
+
+def _validate_identification_frame(
+    *,
+    dataset_name: str,
+    csv_path: Path,
+    required_columns: list[str],
+) -> tuple[dict[str, Any], bool]:
+    report: dict[str, Any] = {
+        "path": str(csv_path),
+        "provided": True,
+        "valid": False,
+        "row_count": 0,
+        "errors": [],
+    }
+    try:
+        frame = pd.read_csv(csv_path)
+    except Exception as exc:
+        report["errors"].append(f"{dataset_name}: read failed - {exc}")
+        return report, False
+
+    report["row_count"] = int(len(frame))
+    missing = [column for column in required_columns if column not in frame.columns]
+    if missing:
+        report["errors"].append(f"{dataset_name}: missing required columns {missing}")
+        return report, False
+
+    numeric = frame.loc[:, required_columns].copy()
+    for column in required_columns:
+        numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
+    if numeric.isna().any().any():
+        report["errors"].append(f"{dataset_name}: contains NaN or non-numeric values.")
+        return report, False
+
+    if dataset_name == "ocv_points":
+        soc = numeric["soc"].to_numpy(dtype=float)
+        if np.any((soc < 0) | (soc > 1)):
+            report["errors"].append("ocv_points: soc must be within [0, 1].")
+        if not _strictly_monotonic(soc):
+            report["errors"].append("ocv_points: soc must be strictly monotonic.")
+    elif dataset_name == "cc_cycle":
+        time_s = numeric["time_s"].to_numpy(dtype=float)
+        if np.any(np.diff(time_s) <= 0):
+            report["errors"].append("cc_cycle: time_s must be strictly increasing.")
+    elif dataset_name == "hppc_points":
+        soc_target = numeric["soc_target"].to_numpy(dtype=float)
+        if np.any((soc_target < 0) | (soc_target > 1)):
+            report["errors"].append("hppc_points: soc_target must be within [0, 1].")
+        if not _strictly_monotonic(soc_target):
+            report["errors"].append("hppc_points: soc_target must be strictly monotonic.")
+        if np.any(numeric["r_dis_10s_ohm"].to_numpy(dtype=float) <= 0):
+            report["errors"].append("hppc_points: r_dis_10s_ohm must be > 0.")
+        if np.any(numeric["r_chg_10s_ohm"].to_numpy(dtype=float) <= 0):
+            report["errors"].append("hppc_points: r_chg_10s_ohm must be > 0.")
+
+    if np.any(numeric["temp_k"].to_numpy(dtype=float) <= 0):
+        report["errors"].append(f"{dataset_name}: temp_k must be > 0 K.")
+
+    report["valid"] = len(report["errors"]) == 0
+    return report, bool(report["valid"])
+
+
+def validate_identification_inputs(config: Config) -> dict[str, Any]:
+    ident = config.identification_inputs
+    payload: dict[str, Any] = {
+        "enabled": ident.enabled,
+        "strict": ident.strict,
+        "passed": True,
+        "datasets": {
+            "ocv_points": {"provided": False, "valid": False, "path": None, "row_count": 0, "errors": []},
+            "cc_cycle": {"provided": False, "valid": False, "path": None, "row_count": 0, "errors": []},
+            "hppc_points": {"provided": False, "valid": False, "path": None, "row_count": 0, "errors": []},
+        },
+        "errors": [],
+    }
+    if not ident.enabled:
+        return payload
+
+    datasets = [
+        ("ocv_points", ident.ocv_points_csv, ["soc", "ocv_v", "temp_k"]),
+        ("cc_cycle", ident.cc_cycle_csv, ["time_s", "current_a", "voltage_v", "temp_k"]),
+        ("hppc_points", ident.hppc_points_csv, ["soc_target", "r_dis_10s_ohm", "r_chg_10s_ohm", "temp_k"]),
+    ]
+    for dataset_name, dataset_path, required_columns in datasets:
+        if dataset_path is None:
+            if ident.strict:
+                payload["errors"].append(f"{dataset_name}: path not provided.")
+            continue
+        report, valid = _validate_identification_frame(
+            dataset_name=dataset_name,
+            csv_path=dataset_path,
+            required_columns=required_columns,
+        )
+        payload["datasets"][dataset_name] = report
+        if not valid:
+            payload["errors"].extend(report["errors"])
+
+    provided_all = all(path is not None for _, path, _ in datasets)
+    datasets_valid = all(payload["datasets"][name]["valid"] for name, _, _ in datasets)
+    if ident.strict:
+        payload["passed"] = bool(provided_all and datasets_valid and not payload["errors"])
+    else:
+        any_valid = any(payload["datasets"][name]["valid"] for name, _, _ in datasets)
+        payload["passed"] = bool(any_valid and not payload["errors"])
+    return payload
+
+
+def _merge_identification_validation(
+    summary: dict[str, Any],
+    validation: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    summary["identification_inputs_validation"] = validation
+    if not validation.get("enabled", False):
+        return
+    if validation.get("strict", False) and not validation.get("passed", False):
+        summary["all_converged"] = False
+        warnings = summary.get("warnings", [])
+        warnings.append(f"{context}: strict identification input validation failed.")
+        summary["warnings"] = _dedupe_messages(warnings)
 
 
 def _load_matplotlib_pyplot():
@@ -510,6 +1311,7 @@ def _solve_with_warning_capture(
     sim: pybamm.Simulation,
     initial_soc: float,
     t_eval: np.ndarray | None = None,
+    use_initial_soc: bool = True,
 ) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
     logger = pybamm.logger
     capture = _WarningCapture()
@@ -520,10 +1322,12 @@ def _solve_with_warning_capture(
 
     start = time.perf_counter()
     try:
-        if t_eval is None:
-            solution = sim.solve(initial_soc=initial_soc)
-        else:
-            solution = sim.solve(t_eval=t_eval, initial_soc=initial_soc)
+        solve_kwargs: dict[str, Any] = {}
+        if t_eval is not None:
+            solve_kwargs["t_eval"] = t_eval
+        if use_initial_soc:
+            solve_kwargs["initial_soc"] = initial_soc
+        solution = sim.solve(**solve_kwargs)
         error = None
     except Exception as exc:
         solution = None
@@ -546,31 +1350,84 @@ def simulate_from_timeseries(
     currents = validated["current_a"].to_numpy(dtype=float)
     input_temps = validated["temp_k"].to_numpy(dtype=float)
 
-    model = pybamm.lithium_ion.DFN(options={"thermal": config.thermal})
-    solver = pybamm.IDAKLUSolver(rtol=config.solver_rtol, atol=config.solver_atol)
-    parameter_values = base_values.copy()
-    parameter_values.update(
-        {
-            "Current function [A]": pybamm.Interpolant(times, currents, pybamm.t),
-            # Replay mode should follow the provided current profile without stopping at built-in cutoffs.
-            "Lower voltage cut-off [V]": 0.0,
-            "Upper voltage cut-off [V]": 6.0,
-        }
-    )
-    sim = pybamm.Simulation(
-        model=model,
-        parameter_values=parameter_values,
-        solver=solver,
-    )
+    model = _build_core_model(config)
+    idaklu_solver = pybamm.IDAKLUSolver(rtol=config.solver_rtol, atol=config.solver_atol)
+    effective_initial_soc = _effective_initial_soc(config, initial_soc)
+    use_initial_soc = _uses_initial_soc_argument(config)
+    parameter_values = _set_initial_soc_if_supported(base_values, effective_initial_soc)
+    updates: dict[str, Any] = {
+        "Current function [A]": pybamm.Interpolant(times, currents, pybamm.t),
+    }
+    # Replay mode should follow the provided current profile without stopping at built-in cutoffs.
+    if "Lower voltage cut-off [V]" in parameter_values.keys():
+        updates["Lower voltage cut-off [V]"] = 0.0
+    if "Upper voltage cut-off [V]" in parameter_values.keys():
+        updates["Upper voltage cut-off [V]"] = 6.0
+    if config.model_type == "dfn":
+        if config.thermal == "lumped" and config.timeseries.use_temp_as_ambient_boundary:
+            updates["Ambient temperature [K]"] = pybamm.Interpolant(times, input_temps, pybamm.t)
+    parameter_values.update(updates)
+    def _solve_with_solver(solver_obj: pybamm.BaseSolver) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
+        sim = pybamm.Simulation(
+            model=model,
+            parameter_values=parameter_values,
+            solver=solver_obj,
+        )
+        return _solve_with_warning_capture(
+            sim, effective_initial_soc, t_eval=times, use_initial_soc=use_initial_soc
+        )
 
-    solution, runtime, warnings, error = _solve_with_warning_capture(sim, initial_soc, t_eval=times)
+    solution, runtime, warnings, error = _solve_with_solver(idaklu_solver)
+    tried_casadi = False
+
+    def _retry_with_casadi(reason: str) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
+        nonlocal tried_casadi
+        tried_casadi = True
+        fallback_solver = pybamm.CasadiSolver(mode="safe", rtol=config.solver_rtol, atol=config.solver_atol)
+        fb_solution, fb_runtime, fb_warnings, fb_error = _solve_with_solver(fallback_solver)
+        merged_warnings = _dedupe_messages(
+            warnings
+            + [reason]
+            + fb_warnings
+        )
+        return fb_solution, fb_runtime, merged_warnings, fb_error
+
+    total_runtime = runtime
+    if (solution is None or isinstance(solution, pybamm.EmptySolution)) and _should_retry_with_casadi(config, error):
+        solution, fb_runtime, warnings, fb_error = _retry_with_casadi(
+            "IDAKLU solver failed with stiff error signature; retrying with CasadiSolver(mode='safe')."
+        )
+        total_runtime += fb_runtime
+        if solution is not None and not isinstance(solution, pybamm.EmptySolution):
+            error = fb_error
+        else:
+            error = fb_error or error
+
+    runtime = total_runtime
     if solution is None or isinstance(solution, pybamm.EmptySolution):
         return None, runtime, warnings, error or "Timeseries simulation produced an empty solution."
 
-    dense = _solution_to_frame(solution, config, initial_soc=initial_soc)
+    dense = _solution_to_frame(solution, config, initial_soc=effective_initial_soc)
     dense_time = dense["time_s"].to_numpy(dtype=float)
     if dense_time.size == 0:
         return None, runtime, warnings, "Timeseries simulation produced no time points."
+    if dense_time[-1] < times[-1] - 1e-9 and not tried_casadi:
+        solution, fb_runtime, warnings, fb_error = _retry_with_casadi(
+            (
+                "IDAKLU solver terminated early in replay mode; "
+                "retrying with CasadiSolver(mode='safe')."
+            )
+        )
+        total_runtime += fb_runtime
+        runtime = total_runtime
+        error = fb_error
+        if solution is None or isinstance(solution, pybamm.EmptySolution):
+            return None, runtime, warnings, error or "Timeseries simulation produced an empty solution."
+        dense = _solution_to_frame(solution, config, initial_soc=effective_initial_soc)
+        dense_time = dense["time_s"].to_numpy(dtype=float)
+        if dense_time.size == 0:
+            return None, runtime, warnings, "Timeseries simulation produced no time points."
+
     if dense_time[-1] < times[-1] - 1e-9:
         return (
             None,
@@ -579,13 +1436,19 @@ def simulate_from_timeseries(
             f"Timeseries simulation terminated early ({dense_time[-1]:.3f}s < {times[-1]:.3f}s).",
         )
 
+    if config.thermal == "lumped":
+        temperature_out = np.interp(times, dense_time, dense["temperature_k"].to_numpy(dtype=float))
+    else:
+        temperature_out = input_temps
+
     frame = pd.DataFrame(
         {
             "time_s": times,
             "current_a": currents,
             "voltage_v": np.interp(times, dense_time, dense["voltage_v"].to_numpy(dtype=float)),
+            "ocv_v": np.interp(times, dense_time, dense["ocv_v"].to_numpy(dtype=float)),
             "soc": np.interp(times, dense_time, dense["soc"].to_numpy(dtype=float)),
-            "temperature_k": input_temps,
+            "temperature_k": temperature_out,
         }
     )
     return frame, runtime, warnings, error
@@ -611,15 +1474,19 @@ def _run_sanity_gate(config: Config, base_values: pybamm.ParameterValues, output
         json_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
         return result
 
-    model = pybamm.lithium_ion.DFN(options={"thermal": config.thermal})
+    model = _build_core_model(config)
     solver = pybamm.IDAKLUSolver(rtol=config.solver_rtol, atol=config.solver_atol)
+    initial_soc = _effective_initial_soc(config, config.initial_soc)
+    parameter_values = _set_initial_soc_if_supported(base_values, initial_soc)
     sim = pybamm.Simulation(
         model=model,
-        parameter_values=base_values.copy(),
+        parameter_values=parameter_values,
         experiment=_build_sanity_experiment(config),
         solver=solver,
     )
-    solution, runtime, warnings, error = _solve_with_warning_capture(sim, config.initial_soc)
+    solution, runtime, warnings, error = _solve_with_warning_capture(
+        sim, initial_soc, use_initial_soc=_uses_initial_soc_argument(config)
+    )
     has_pos = False
     has_neg = False
     if solution is None or isinstance(solution, pybamm.EmptySolution):
@@ -655,17 +1522,22 @@ def _run_sanity_gate(config: Config, base_values: pybamm.ParameterValues, output
 
 def _run_baseline_case(config: Config, base_values: pybamm.ParameterValues, rate_c: float, output_dir: Path) -> RunSummary:
     csv_path = output_dir / f"{_case_id(rate_c)}.csv"
-    model = pybamm.lithium_ion.DFN(options={"thermal": config.thermal})
+    model = _build_core_model(config)
     solver = pybamm.IDAKLUSolver(rtol=config.solver_rtol, atol=config.solver_atol)
+    initial_soc = _effective_initial_soc(config, config.initial_soc)
+    parameter_values = _set_initial_soc_if_supported(base_values, initial_soc)
     sim = pybamm.Simulation(
         model=model,
-        parameter_values=base_values.copy(),
+        parameter_values=parameter_values,
         experiment=_build_baseline_experiment(config, rate_c),
         solver=solver,
     )
     start = time.perf_counter()
     try:
-        solution = sim.solve(initial_soc=config.initial_soc)
+        solve_kwargs: dict[str, Any] = {}
+        if _uses_initial_soc_argument(config):
+            solve_kwargs["initial_soc"] = initial_soc
+        solution = sim.solve(**solve_kwargs)
     except Exception as exc:
         return RunSummary(
             case_id=_case_id(rate_c),
@@ -675,19 +1547,27 @@ def _run_baseline_case(config: Config, base_values: pybamm.ParameterValues, rate
             final_soc=None,
             runtime_s=time.perf_counter() - start,
             csv_path=None,
+            termination=replace(_default_termination_result(), reason="Simulation solve failed."),
             error=str(exc),
         )
     runtime = time.perf_counter() - start
     frame = _solution_to_frame(solution, config)
+    frame, termination, termination_error = _apply_termination_with_context(
+        frame, config, context_mode="baseline"
+    )
     frame.to_csv(csv_path, index=False)
+    converged = termination_error is None
+    case_error = termination_error
     return RunSummary(
         case_id=_case_id(rate_c),
-        converged=True,
+        converged=converged,
         min_v=float(np.min(frame["voltage_v"])),
         max_v=float(np.max(frame["voltage_v"])),
         final_soc=float(frame["soc"].iloc[-1]),
         runtime_s=runtime,
         csv_path=str(csv_path),
+        termination=termination,
+        error=case_error,
     )
 
 
@@ -717,17 +1597,20 @@ def _run_charge_compare_case(
         period_s=period_s,
     )
 
-    model = pybamm.lithium_ion.DFN(options={"thermal": config.thermal})
+    model = _build_core_model(config)
     solver = pybamm.IDAKLUSolver(rtol=config.solver_rtol, atol=config.solver_atol)
+    initial_soc = _effective_initial_soc(config, config.timeseries.charge_compare.soc_start)
+    parameter_values = _set_initial_soc_if_supported(base_values, initial_soc)
     sim = pybamm.Simulation(
         model=model,
-        parameter_values=base_values.copy(),
+        parameter_values=parameter_values,
         experiment=experiment,
         solver=solver,
     )
     solution, runtime, warnings, error = _solve_with_warning_capture(
         sim,
-        initial_soc=config.timeseries.charge_compare.soc_start,
+        initial_soc=initial_soc,
+        use_initial_soc=_uses_initial_soc_argument(config),
     )
     if solution is None or isinstance(solution, pybamm.EmptySolution):
         _write_empty_timeseries(csv_path)
@@ -743,17 +1626,21 @@ def _run_charge_compare_case(
             cc_end_time_s=None,
             cv_time_s=None,
             csv_path=str(csv_path),
+            termination=replace(_default_termination_result(), reason="Charge compare simulation failed."),
             error=error or "Charge compare simulation produced an empty solution.",
         )
         return case, warnings
 
-    frame = _solution_to_frame(solution, config, initial_soc=config.timeseries.charge_compare.soc_start)
+    frame = _solution_to_frame(solution, config, initial_soc=initial_soc)
+    frame, termination, termination_error = _apply_termination_with_context(
+        frame, config, context_mode="charge_compare"
+    )
     frame.to_csv(csv_path, index=False)
     final_soc = float(frame["soc"].iloc[-1])
     charge_time_s = float(frame["time_s"].iloc[-1])
     cc_end_time_s = _cc_transition_time(frame, config.timeseries.charge_compare.voltage_high_v)
     cv_time_s = None if cc_end_time_s is None else max(0.0, charge_time_s - cc_end_time_s)
-    case_error = error
+    case_error = error or termination_error
     if case_error is None and cv_time_s is not None and cv_time_s <= 0:
         case_error = "CV segment duration is zero."
     if case_error is None and final_soc < 0.99:
@@ -771,6 +1658,7 @@ def _run_charge_compare_case(
         cc_end_time_s=cc_end_time_s,
         cv_time_s=cv_time_s,
         csv_path=str(csv_path),
+        termination=termination,
         error=case_error,
     )
     return case, warnings
@@ -821,23 +1709,580 @@ def _write_overlay(output_dir: Path, case_summaries: list[RunSummary], filename:
     return plot_path, None
 
 
+def _resolve_benchmark_profiles(config: Config) -> dict[str, Config]:
+    disabled_timeseries = replace(
+        config.timeseries,
+        enabled=False,
+        csv_path=None,
+        charge_compare=replace(config.timeseries.charge_compare, enabled=False),
+    )
+    common = replace(
+        config,
+        discharge_rates_c=list(config.benchmark.rates_c),
+        charge_cc_rate=config.benchmark.charge_cc_rate,
+        cv_cutoff_c_rate=config.benchmark.cv_cutoff_c_rate,
+        rest_min=config.benchmark.rest_min,
+        period_s=config.benchmark.period_s,
+        sanity_gate=replace(config.sanity_gate, enabled=False),
+        hppc=replace(config.hppc, enabled=False),
+        timeseries=disabled_timeseries,
+        identification_inputs=replace(config.identification_inputs, enabled=False),
+    )
+    return {
+        "dfn_nmc": replace(
+            common,
+            model_type="dfn",
+            chemistry="nmc",
+            nominal_capacity_ah=150.0,
+            parameter_set="Chen2020",
+            voltage_low_v=2.8,
+            voltage_high_v=4.2,
+        ),
+        "dfn_lfp": replace(
+            common,
+            model_type="dfn",
+            chemistry="lfp",
+            nominal_capacity_ah=130.0,
+            parameter_set="Prada2013",
+            voltage_low_v=2.5,
+            voltage_high_v=3.6,
+        ),
+        "ecm_nmc": replace(
+            common,
+            model_type="ecm",
+            chemistry="nmc",
+            nominal_capacity_ah=150.0,
+            parameter_set="ECM_Example",
+            voltage_low_v=3.2,
+            voltage_high_v=4.2,
+        ),
+        "ecm_lfp": replace(
+            common,
+            model_type="ecm",
+            chemistry="lfp",
+            nominal_capacity_ah=130.0,
+            parameter_set="ECM_Example",
+            voltage_low_v=3.2,
+            voltage_high_v=4.2,
+        ),
+    }
+
+
+def _benchmark_discharge_mean_voltage(csv_path: str | None) -> float | None:
+    if not csv_path:
+        return None
+    path = Path(csv_path)
+    if not path.exists():
+        return None
+    frame = pd.read_csv(path)
+    if frame.empty or "current_a" not in frame or "voltage_v" not in frame:
+        return None
+
+    pos = frame[frame["current_a"] > 1e-6]
+    neg = frame[frame["current_a"] < -1e-6]
+
+    def _soc_drop(candidate: pd.DataFrame) -> float:
+        if len(candidate) < 2 or "soc" not in candidate:
+            return float("-inf")
+        return float(candidate["soc"].iloc[0] - candidate["soc"].iloc[-1])
+
+    if len(pos) >= 2 and len(neg) >= 2:
+        segment = pos if _soc_drop(pos) >= _soc_drop(neg) else neg
+    elif len(pos) >= 2:
+        segment = pos
+    elif len(neg) >= 2:
+        segment = neg
+    else:
+        return None
+    return float(segment["voltage_v"].mean())
+
+
+def _write_benchmark_report(
+    report_path: Path,
+    *,
+    benchmark_payload: dict[str, Any],
+    quality_gate_payload: dict[str, Any],
+    matrix_rows: list[dict[str, Any]],
+) -> None:
+    proxy_profiles = sorted(
+        {
+            str(row.get("profile_id"))
+            for row in matrix_rows
+            if _infer_parameter_quality_level(str(row.get("parameter_set", ""))) == "proxy"
+        }
+    )
+    suggestions: list[str] = []
+    for failure in benchmark_payload["failures"]:
+        category = str(failure.get("category", ""))
+        if category == "convergence_rate":
+            suggestions.append("Reduce protocol stiffness or relax solver tolerances for failing profile-rate cases.")
+        elif category == "repeatability_final_soc":
+            suggestions.append("Inspect initial-condition determinism and numerical tolerances for SOC repeatability.")
+        elif category == "repeatability_min_v":
+            suggestions.append("Inspect voltage interpolation and event handling around cutoff regions.")
+        elif category == "polarization_trend":
+            suggestions.append("Check sign convention and discharge-segment extraction for trend calculation.")
+        elif category == "identification_inputs":
+            suggestions.append("Fix identification template data quality or disable strict validation for this benchmark run.")
+    suggestions = _dedupe_messages(suggestions)
+
+    lines = [
+        "# Benchmark Compare Report",
+        "",
+        "## Gate Conclusion",
+        f"- Gate passed: `{benchmark_payload['passed']}`",
+        f"- Passed: `{benchmark_payload['passed']}`",
+        f"- Total cases: `{benchmark_payload['total_cases']}`",
+        f"- Converged cases: `{benchmark_payload['converged_cases']}`",
+        f"- Convergence rate: `{benchmark_payload['convergence_rate']:.4f}`",
+        "",
+        "## Quality Gate",
+        f"- Enabled: `{quality_gate_payload['enabled']}`",
+        f"- Enforce: `{quality_gate_payload['enforce']}`",
+        f"- Passed: `{quality_gate_payload['passed']}`",
+        "",
+        "## Parameter Quality",
+        f"- Proxy profiles: `{proxy_profiles}`",
+        "",
+        "## Trend Checks",
+    ]
+    for check in benchmark_payload["trend_checks"]:
+        lines.append(
+            f"- `{check['profile_id']} / repeat_{check['repeat']}`: "
+            f"`{check['high_rate']}C` ({check['high_rate_mean_v']}) < "
+            f"`{check['low_rate']}C` ({check['low_rate_mean_v']}) -> `{check['passed']}`"
+        )
+    if benchmark_payload["failures"]:
+        lines.append("")
+        lines.append("## Failures")
+        for failure in benchmark_payload["failures"]:
+            lines.append(
+                "- "
+                f"[{failure['category']}] profile={failure['profile_id']} "
+                f"rate={failure['rate_c']} repeat={failure['repeat']} "
+                f"reason={failure['reason']} observed={failure['observed']} threshold={failure['threshold']}"
+            )
+    if suggestions:
+        lines.append("")
+        lines.append("## Recommended Actions")
+        for suggestion in suggestions:
+            lines.append(f"- {suggestion}")
+    lines.extend(["", "## Matrix Rows", f"- Rows: `{len(matrix_rows)}`"])
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_benchmark_pipeline(config: Config) -> dict[str, Any]:
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ident_validation = validate_identification_inputs(config)
+    profile_map = _resolve_benchmark_profiles(config)
+    requested_profiles = [profile for profile in config.benchmark.profiles if profile]
+    invalid_profiles = [profile for profile in requested_profiles if profile not in profile_map]
+    if invalid_profiles:
+        raise ValueError(
+            f"benchmark.profiles contains unsupported entries: {invalid_profiles}. "
+            f"Supported: {sorted(profile_map)}"
+        )
+    selected_profiles = requested_profiles or list(profile_map.keys())
+
+    matrix_rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    if not config.benchmark.enabled:
+        matrix_path = output_dir / "benchmark_matrix.csv"
+        pd.DataFrame(matrix_rows).to_csv(matrix_path, index=False)
+        benchmark_summary_path = output_dir / "benchmark_summary.json"
+        report_path = output_dir / "benchmark_compare_report.md"
+        benchmark_payload = {
+            "passed": True,
+            "total_cases": 0,
+            "converged_cases": 0,
+            "convergence_rate": 1.0,
+            "repeatability": {"max_delta_final_soc": 0.0, "max_delta_min_v": 0.0, "details": []},
+            "trend_checks": [],
+            "failures": [],
+            "artifacts": {
+                "benchmark_matrix_csv": str(matrix_path),
+                "benchmark_summary_json": str(benchmark_summary_path),
+                "benchmark_compare_report_md": str(report_path),
+            },
+        }
+        quality_gate_payload = {
+            "enabled": config.quality_gate.enabled,
+            "enforce": config.quality_gate.enforce,
+            "passed": True,
+            "thresholds": asdict(config.quality_gate),
+            "metrics": {
+                "convergence_rate": 1.0,
+                "max_delta_final_soc": 0.0,
+                "max_delta_min_v": 0.0,
+                "repeat_pairs": 0,
+                "failed_trend_checks": 0,
+                "failure_count": 0,
+            },
+        }
+        benchmark_summary_path.write_text(json.dumps(benchmark_payload, indent=2), encoding="utf-8")
+        _write_benchmark_report(
+            report_path,
+            benchmark_payload=benchmark_payload,
+            quality_gate_payload=quality_gate_payload,
+            matrix_rows=matrix_rows,
+        )
+        config_dict = _config_to_summary_dict(config)
+        summary = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "benchmark",
+            "all_converged": True,
+            "config": config_dict,
+            "termination_policy": asdict(config.termination),
+            "termination_hits": 0,
+            "artifacts": benchmark_payload["artifacts"],
+            "quality_gate": quality_gate_payload,
+            "benchmark": benchmark_payload,
+            "cases": [],
+            "warnings": ["Benchmark disabled by configuration."],
+        }
+        _merge_identification_validation(summary, ident_validation, context="benchmark")
+        _write_summary_json(output_dir, summary)
+        return summary
+
+    for profile_id in selected_profiles:
+        profile_cfg = profile_map[profile_id]
+        for repeat_index in range(1, max(1, config.benchmark.repeats) + 1):
+            repeat_output = output_dir / "benchmark_runs" / profile_id / f"repeat_{repeat_index}"
+            run_cfg = replace(profile_cfg, output_dir=repeat_output)
+            run_summary = run_baseline_pipeline(run_cfg)
+            warnings.extend(run_summary.get("warnings", []))
+            for case in run_summary.get("cases", []):
+                case_rate = _rate_from_case_id(str(case.get("case_id", "")))
+                matrix_rows.append(
+                    {
+                        "profile_id": profile_id,
+                        "model_type": profile_cfg.model_type,
+                        "chemistry": profile_cfg.chemistry,
+                        "nominal_capacity_ah": profile_cfg.nominal_capacity_ah,
+                        "parameter_set": profile_cfg.parameter_set,
+                        "repeat": repeat_index,
+                        "rate_c": case_rate,
+                        "case_id": case["case_id"],
+                        "converged": bool(case["converged"]),
+                        "runtime_s": case["runtime_s"],
+                        "min_v": case["min_v"],
+                        "max_v": case["max_v"],
+                        "final_soc": case["final_soc"],
+                        "csv_path": case["csv_path"],
+                        "error": case.get("error"),
+                        "termination_hit": case.get("termination", {}).get("hit", False),
+                        "mean_discharge_voltage_v": _benchmark_discharge_mean_voltage(case.get("csv_path")),
+                    }
+                )
+
+    matrix_path = output_dir / "benchmark_matrix.csv"
+    pd.DataFrame(matrix_rows).to_csv(matrix_path, index=False)
+
+    total_cases = len(matrix_rows)
+    converged_cases = sum(1 for row in matrix_rows if row["converged"])
+    convergence_rate = (converged_cases / total_cases) if total_cases else 0.0
+
+    repeat_details: list[dict[str, Any]] = []
+    max_delta_final_soc = 0.0
+    max_delta_min_v = 0.0
+    rates = sorted(set(float(rate) for rate in config.benchmark.rates_c))
+    for profile_id in selected_profiles:
+        for rate_c in rates:
+            candidates = [
+                row
+                for row in matrix_rows
+                if row["profile_id"] == profile_id
+                and row["rate_c"] is not None
+                and np.isclose(float(row["rate_c"]), float(rate_c), atol=1e-10)
+            ]
+            candidates = sorted(candidates, key=lambda row: int(row["repeat"]))
+            if len(candidates) < 2:
+                continue
+            left = candidates[0]
+            right = candidates[1]
+            if left["converged"] and right["converged"] and left["final_soc"] is not None and right["final_soc"] is not None:
+                delta_soc = abs(float(left["final_soc"]) - float(right["final_soc"]))
+            else:
+                delta_soc = float("inf")
+            if left["converged"] and right["converged"] and left["min_v"] is not None and right["min_v"] is not None:
+                delta_min_v = abs(float(left["min_v"]) - float(right["min_v"]))
+            else:
+                delta_min_v = float("inf")
+            if np.isfinite(delta_soc):
+                max_delta_final_soc = max(max_delta_final_soc, delta_soc)
+            if np.isfinite(delta_min_v):
+                max_delta_min_v = max(max_delta_min_v, delta_min_v)
+            repeat_details.append(
+                {
+                    "profile_id": profile_id,
+                    "rate_c": rate_c,
+                    "repeat_a": int(left["repeat"]),
+                    "repeat_b": int(right["repeat"]),
+                    "delta_final_soc": None if not np.isfinite(delta_soc) else float(delta_soc),
+                    "delta_min_v": None if not np.isfinite(delta_min_v) else float(delta_min_v),
+                    "passed": bool(np.isfinite(delta_soc) and np.isfinite(delta_min_v)),
+                }
+            )
+
+    low_rate = float(rates[0]) if rates else 0.2
+    high_rate = float(rates[-1]) if rates else 1.0
+    trend_checks: list[dict[str, Any]] = []
+    for profile_id in selected_profiles:
+        for repeat_index in range(1, max(1, config.benchmark.repeats) + 1):
+            low_rows = [
+                row
+                for row in matrix_rows
+                if row["profile_id"] == profile_id
+                and int(row["repeat"]) == repeat_index
+                and row["rate_c"] is not None
+                and np.isclose(float(row["rate_c"]), low_rate, atol=1e-10)
+            ]
+            high_rows = [
+                row
+                for row in matrix_rows
+                if row["profile_id"] == profile_id
+                and int(row["repeat"]) == repeat_index
+                and row["rate_c"] is not None
+                and np.isclose(float(row["rate_c"]), high_rate, atol=1e-10)
+            ]
+            low_v = low_rows[0]["mean_discharge_voltage_v"] if low_rows else None
+            high_v = high_rows[0]["mean_discharge_voltage_v"] if high_rows else None
+            passed = (
+                low_v is not None
+                and high_v is not None
+                and np.isfinite(float(low_v))
+                and np.isfinite(float(high_v))
+                and float(high_v) < float(low_v)
+            )
+            trend_checks.append(
+                {
+                    "profile_id": profile_id,
+                    "repeat": repeat_index,
+                    "low_rate": low_rate,
+                    "high_rate": high_rate,
+                    "low_rate_mean_v": None if low_v is None else float(low_v),
+                    "high_rate_mean_v": None if high_v is None else float(high_v),
+                    "passed": bool(passed),
+                }
+            )
+
+    quality_gate = config.quality_gate
+    failures: list[dict[str, Any]] = []
+
+    def _failure(
+        *,
+        category: str,
+        reason: str,
+        profile_id: str | None = None,
+        rate_c: float | None = None,
+        repeat: int | None = None,
+        observed: float | str | None = None,
+        threshold: float | str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "category": category,
+            "reason": reason,
+            "profile_id": profile_id,
+            "rate_c": None if rate_c is None else float(rate_c),
+            "repeat": None if repeat is None else int(repeat),
+            "observed": observed,
+            "threshold": threshold,
+        }
+
+    if quality_gate.enabled:
+        if convergence_rate < quality_gate.min_convergence_rate:
+            failed_rows = [row for row in matrix_rows if not row["converged"]]
+            if failed_rows:
+                for row in failed_rows:
+                    failures.append(
+                        _failure(
+                            category="convergence_rate",
+                            reason=row.get("error") or "Case did not converge.",
+                            profile_id=str(row.get("profile_id")),
+                            rate_c=row.get("rate_c"),
+                            repeat=int(row.get("repeat")) if row.get("repeat") is not None else None,
+                            observed=convergence_rate,
+                            threshold=quality_gate.min_convergence_rate,
+                        )
+                    )
+            else:
+                failures.append(
+                    _failure(
+                        category="convergence_rate",
+                        reason="Convergence rate below threshold.",
+                        observed=convergence_rate,
+                        threshold=quality_gate.min_convergence_rate,
+                    )
+                )
+        if repeat_details:
+            if max_delta_final_soc > quality_gate.max_repeat_delta_final_soc:
+                for detail in repeat_details:
+                    delta = detail.get("delta_final_soc")
+                    if delta is None or float(delta) <= quality_gate.max_repeat_delta_final_soc:
+                        continue
+                    failures.append(
+                        _failure(
+                            category="repeatability_final_soc",
+                            reason="Repeatability(delta_final_soc) exceeded threshold.",
+                            profile_id=str(detail.get("profile_id")),
+                            rate_c=detail.get("rate_c"),
+                            repeat=int(detail.get("repeat_b")) if detail.get("repeat_b") is not None else None,
+                            observed=float(delta),
+                            threshold=quality_gate.max_repeat_delta_final_soc,
+                        )
+                    )
+            if max_delta_min_v > quality_gate.max_repeat_delta_min_v:
+                for detail in repeat_details:
+                    delta = detail.get("delta_min_v")
+                    if delta is None or float(delta) <= quality_gate.max_repeat_delta_min_v:
+                        continue
+                    failures.append(
+                        _failure(
+                            category="repeatability_min_v",
+                            reason="Repeatability(delta_min_v) exceeded threshold.",
+                            profile_id=str(detail.get("profile_id")),
+                            rate_c=detail.get("rate_c"),
+                            repeat=int(detail.get("repeat_b")) if detail.get("repeat_b") is not None else None,
+                            observed=float(delta),
+                            threshold=quality_gate.max_repeat_delta_min_v,
+                        )
+                    )
+        else:
+            failures.append(
+                _failure(
+                    category="repeatability_data",
+                    reason="Repeatability checks could not be computed (insufficient repeat data).",
+                    observed=0,
+                    threshold=2,
+                )
+            )
+        if quality_gate.require_polarization_trend:
+            failed_trends = [check for check in trend_checks if not check["passed"]]
+            for check in failed_trends:
+                failures.append(
+                    _failure(
+                        category="polarization_trend",
+                        reason="Polarization trend check failed.",
+                        profile_id=str(check.get("profile_id")),
+                        rate_c=float(check.get("high_rate")) if check.get("high_rate") is not None else None,
+                        repeat=int(check.get("repeat")) if check.get("repeat") is not None else None,
+                        observed=check.get("high_rate_mean_v"),
+                        threshold=check.get("low_rate_mean_v"),
+                    )
+                )
+
+    if ident_validation.get("enabled") and ident_validation.get("strict") and not ident_validation.get("passed"):
+        failures.append(
+            _failure(
+                category="identification_inputs",
+                reason="Strict identification input validation failed.",
+                observed=False,
+                threshold=True,
+            )
+        )
+
+    gate_passed = len(failures) == 0
+    quality_gate_payload = {
+        "enabled": quality_gate.enabled,
+        "enforce": quality_gate.enforce,
+        "passed": gate_passed,
+        "thresholds": asdict(quality_gate),
+        "metrics": {
+            "convergence_rate": convergence_rate,
+            "max_delta_final_soc": max_delta_final_soc,
+            "max_delta_min_v": max_delta_min_v,
+            "repeat_pairs": len(repeat_details),
+            "failed_trend_checks": sum(1 for check in trend_checks if not check["passed"]),
+            "failure_count": len(failures),
+        },
+    }
+
+    benchmark_summary_path = output_dir / "benchmark_summary.json"
+    report_path = output_dir / "benchmark_compare_report.md"
+    benchmark_payload: dict[str, Any] = {
+        "passed": gate_passed,
+        "total_cases": total_cases,
+        "converged_cases": converged_cases,
+        "convergence_rate": convergence_rate,
+        "repeatability": {
+            "max_delta_final_soc": max_delta_final_soc,
+            "max_delta_min_v": max_delta_min_v,
+            "details": repeat_details,
+        },
+        "trend_checks": trend_checks,
+        "failures": failures,
+        "artifacts": {
+            "benchmark_matrix_csv": str(matrix_path),
+            "benchmark_summary_json": str(benchmark_summary_path),
+            "benchmark_compare_report_md": str(report_path),
+        },
+    }
+    benchmark_summary_path.write_text(json.dumps(benchmark_payload, indent=2), encoding="utf-8")
+    _write_benchmark_report(
+        report_path,
+        benchmark_payload=benchmark_payload,
+        quality_gate_payload=quality_gate_payload,
+        matrix_rows=matrix_rows,
+    )
+
+    config_dict = _config_to_summary_dict(config)
+
+    all_converged = gate_passed if quality_gate.enforce else True
+    summary: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "benchmark",
+        "all_converged": all_converged,
+        "config": config_dict,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": sum(1 for row in matrix_rows if row.get("termination_hit")),
+        "artifacts": {
+            "benchmark_matrix_csv": str(matrix_path),
+            "benchmark_summary_json": str(benchmark_summary_path),
+            "benchmark_compare_report_md": str(report_path),
+        },
+        "quality_gate": quality_gate_payload,
+        "benchmark": benchmark_payload,
+        "cases": matrix_rows,
+    }
+    proxy_profiles = sorted(
+        {
+            profile_id
+            for profile_id in selected_profiles
+            if _infer_parameter_quality_level(profile_map[profile_id].parameter_set) == "proxy"
+        }
+    )
+    if proxy_profiles:
+        warnings.append(
+            "Proxy parameter packs used in benchmark profiles: "
+            + ", ".join(proxy_profiles)
+            + ". Interpret absolute values cautiously."
+        )
+    if warnings:
+        summary["warnings"] = _dedupe_messages(warnings)
+    _merge_identification_validation(summary, ident_validation, context="benchmark")
+    _write_summary_json(output_dir, summary)
+    return summary
+
+
 def run_baseline_pipeline(config: Config) -> dict[str, Any]:
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ident_validation = validate_identification_inputs(config)
 
     base_values, scaling = _build_parameter_values(config)
     audit_path = _write_parameter_audit(config, output_dir, scaling)
     gate = _run_sanity_gate(config, base_values, output_dir)
 
-    config_dict = asdict(config)
-    config_dict["output_dir"] = str(config.output_dir)
-    if config.timeseries.csv_path is not None:
-        config_dict["timeseries"]["csv_path"] = str(config.timeseries.csv_path)
+    config_dict = _config_to_summary_dict(config)
     summary: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "baseline",
         "all_converged": False,
         "config": config_dict,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": 0,
         "artifacts": {
             "parameter_audit": str(audit_path),
             "sanity_gate_csv": gate.artifact_csv,
@@ -852,14 +2297,19 @@ def run_baseline_pipeline(config: Config) -> dict[str, Any]:
         warnings.append("Sanity gate failed; batch simulations were blocked.")
         if gate.error:
             warnings.append(f"Sanity gate error: {gate.error}")
+        proxy_warning = _proxy_parameter_warning(config)
+        if proxy_warning:
+            warnings.append(proxy_warning)
         summary["warnings"] = _dedupe_messages(warnings)
-        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        _merge_identification_validation(summary, ident_validation, context="baseline")
+        _write_summary_json(output_dir, summary)
         return summary
 
     cases = [_run_baseline_case(config, base_values, rate_c, output_dir) for rate_c in config.discharge_rates_c]
     overlay_path, overlay_warning = _write_overlay(output_dir, cases, "voltage_overlay.png", "DFN Baseline Voltage Overlay")
 
     summary["all_converged"] = all(case.converged for case in cases)
+    summary["termination_hits"] = sum(1 for case in cases if case.termination.hit)
     summary["artifacts"]["voltage_overlay_png"] = str(overlay_path)
     summary["cases"] = [asdict(case) for case in cases]
 
@@ -881,16 +2331,22 @@ def run_baseline_pipeline(config: Config) -> dict[str, Any]:
             )
     if warnings:
         summary["warnings"] = _dedupe_messages(warnings)
+    proxy_warning = _proxy_parameter_warning(config)
+    if proxy_warning:
+        warning_list = summary.get("warnings", [])
+        warning_list.append(proxy_warning)
+        summary["warnings"] = _dedupe_messages(warning_list)
 
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _merge_identification_validation(summary, ident_validation, context="baseline")
+    _write_summary_json(output_dir, summary)
     return summary
 
 
 def _soc_grid(start: float, end: float, step: float) -> list[float]:
     if step <= 0:
         raise ValueError("hppc.soc_step must be positive.")
-    if not (0 < end <= start <= 1):
-        raise ValueError("hppc SOC range must satisfy 0 < soc_end <= soc_start <= 1.")
+    if not (0 <= end <= start <= 1):
+        raise ValueError("hppc SOC range must satisfy 0 <= soc_end <= soc_start <= 1.")
     values: list[float] = []
     current = start
     epsilon = step * 0.1
@@ -995,9 +2451,11 @@ def _run_hppc_point(
             has_negative_current=False,
             csv_path=str(csv_path),
             warning_messages=warnings,
+            termination=replace(_default_termination_result(), reason="Timeseries simulation failed."),
             error=error,
         )
 
+    frame, termination, termination_error = _apply_termination(frame, config.termination)
     frame.to_csv(csv_path, index=False)
     nonzero = frame.loc[np.abs(frame["current_a"]) > 1e-6, "current_a"]
     has_pos = bool((nonzero > 0).any())
@@ -1005,7 +2463,7 @@ def _run_hppc_point(
     metrics, metric_error = _compute_hppc_metrics(frame)
     infeasible = [message for message in warnings if _warning_is_infeasible(message)]
 
-    point_error = error
+    point_error = error or termination_error
     if point_error is None and not has_pos:
         point_error = "No positive current segment detected."
     if point_error is None and not has_neg:
@@ -1038,6 +2496,7 @@ def _run_hppc_point(
         has_negative_current=has_neg,
         csv_path=str(csv_path),
         warning_messages=warnings,
+        termination=termination,
         error=point_error,
     )
 
@@ -1056,6 +2515,9 @@ def _write_hppc_summary_csv(output_dir: Path, points: list[HppcPointResult]) -> 
             "runtime_s": point.runtime_s,
             "passed": point.passed,
             "csv_path": point.csv_path,
+            "termination_hit": point.termination.hit,
+            "termination_time_s": point.termination.time_s,
+            "termination_reason": point.termination.reason,
             "error": point.error,
         }
         for point in points
@@ -1098,6 +2560,7 @@ def _write_hppc_overlay(output_dir: Path, points: list[HppcPointResult]) -> tupl
 def run_hppc_pipeline(config: Config) -> dict[str, Any]:
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ident_validation = validate_identification_inputs(config)
     base_values, scaling = _build_parameter_values(config)
     audit_path = _write_parameter_audit(config, output_dir, scaling)
 
@@ -1135,6 +2598,8 @@ def run_hppc_pipeline(config: Config) -> dict[str, Any]:
         "stop_reason": stop_reason,
         "completed_points": completed_points,
         "total_points": total_points,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": sum(1 for point in points if point.termination.hit),
         "artifacts": {
             "hppc_summary_csv": str(summary_csv),
             "hppc_summary_json": str(output_dir / "hppc_summary.json"),
@@ -1146,15 +2611,14 @@ def run_hppc_pipeline(config: Config) -> dict[str, Any]:
         hppc_payload["overlay_warning"] = overlay_warning
     (output_dir / "hppc_summary.json").write_text(json.dumps(hppc_payload, indent=2), encoding="utf-8")
 
-    config_dict = asdict(config)
-    config_dict["output_dir"] = str(config.output_dir)
-    if config.timeseries.csv_path is not None:
-        config_dict["timeseries"]["csv_path"] = str(config.timeseries.csv_path)
+    config_dict = _config_to_summary_dict(config)
     summary: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "hppc",
         "all_converged": passed,
         "config": config_dict,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": sum(1 for point in points if point.termination.hit),
         "artifacts": {
             "parameter_audit": str(audit_path),
             "hppc_summary_csv": str(summary_csv),
@@ -1171,15 +2635,20 @@ def run_hppc_pipeline(config: Config) -> dict[str, Any]:
         warnings.extend(point.warning_messages)
     if stop_reason and config.hppc.enabled:
         warnings.append(f"HPPC fail-fast triggered: {stop_reason}")
+    proxy_warning = _proxy_parameter_warning(config)
+    if proxy_warning:
+        warnings.append(proxy_warning)
     if warnings:
         summary["warnings"] = _dedupe_messages(warnings)
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _merge_identification_validation(summary, ident_validation, context="hppc")
+    _write_summary_json(output_dir, summary)
     return summary
 
 
 def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ident_validation = validate_identification_inputs(config)
     base_values, scaling = _build_parameter_values(config)
     audit_path = _write_parameter_audit(config, output_dir, scaling)
 
@@ -1216,6 +2685,7 @@ def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
                     cc_end_time_s=None,
                     cv_time_s=None,
                     csv_path=None,
+                    termination=replace(_default_termination_result(), reason="Charge compare case setup failed."),
                     error=str(exc),
                 )
             cases.append(case)
@@ -1253,6 +2723,8 @@ def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
         "passed": passed,
         "completed_cases": completed_cases,
         "total_cases": total_cases,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": sum(1 for case in cases if case.termination.hit),
         "artifacts": {
             "charge_compare_summary_csv": str(summary_csv),
             "charge_compare_summary_json": str(output_dir / "charge_compare_summary.json"),
@@ -1265,16 +2737,15 @@ def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
 
     (output_dir / "charge_compare_summary.json").write_text(json.dumps(charge_payload, indent=2), encoding="utf-8")
 
-    config_dict = asdict(config)
-    config_dict["output_dir"] = str(config.output_dir)
-    if config.timeseries.csv_path is not None:
-        config_dict["timeseries"]["csv_path"] = str(config.timeseries.csv_path)
+    config_dict = _config_to_summary_dict(config)
 
     summary: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "timeseries",
         "all_converged": passed,
         "config": config_dict,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": sum(1 for case in cases if case.termination.hit),
         "artifacts": {
             "parameter_audit": str(audit_path),
             "charge_compare_summary_csv": str(summary_csv),
@@ -1290,7 +2761,13 @@ def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
         stop_warnings = summary.get("warnings", [])
         stop_warnings.append(f"Charge compare incomplete: {stop_reason}")
         summary["warnings"] = _dedupe_messages(stop_warnings)
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    proxy_warning = _proxy_parameter_warning(config)
+    if proxy_warning:
+        warning_list = summary.get("warnings", [])
+        warning_list.append(proxy_warning)
+        summary["warnings"] = _dedupe_messages(warning_list)
+    _merge_identification_validation(summary, ident_validation, context="timeseries-charge-compare")
+    _write_summary_json(output_dir, summary)
     return summary
 
 
@@ -1300,6 +2777,7 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
 
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ident_validation = validate_identification_inputs(config)
     base_values, scaling = _build_parameter_values(config)
     audit_path = _write_parameter_audit(config, output_dir, scaling)
 
@@ -1338,21 +2816,28 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
                     final_soc=None,
                     runtime_s=runtime,
                     csv_path=None,
+                    termination=replace(_default_termination_result(), reason="Timeseries simulation failed."),
                     error=stop_reason,
                 )
             else:
+                frame, termination, termination_error = _apply_termination_with_context(
+                    frame, config, context_mode="timeseries"
+                )
                 frame.to_csv(output_csv, index=False)
+                case_error = sim_error or termination_error
                 case = RunSummary(
                     case_id="timeseries_case",
-                    converged=True,
+                    converged=case_error is None,
                     min_v=float(np.min(frame["voltage_v"])),
                     max_v=float(np.max(frame["voltage_v"])),
                     final_soc=float(frame["soc"].iloc[-1]),
                     runtime_s=runtime,
                     csv_path=str(output_csv),
+                    termination=termination,
+                    error=case_error,
                 )
-                if sim_error:
-                    stop_reason = sim_error
+                if case_error:
+                    stop_reason = case_error
         except Exception as exc:
             stop_reason = str(exc)
             _write_empty_timeseries(output_csv)
@@ -1364,6 +2849,7 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
                 final_soc=None,
                 runtime_s=0.0,
                 csv_path=None,
+                termination=replace(_default_termination_result(), reason="Timeseries pipeline exception."),
                 error=stop_reason,
             )
 
@@ -1373,6 +2859,8 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
         "passed": passed,
         "stop_reason": stop_reason,
         "source_csv": source_csv,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": int(bool(case and case.termination.hit)),
         "artifacts": {
             "timeseries_output_csv": str(output_csv),
             "timeseries_summary_json": str(output_json),
@@ -1381,16 +2869,15 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
     }
     output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    config_dict = asdict(config)
-    config_dict["output_dir"] = str(config.output_dir)
-    if config.timeseries.csv_path is not None:
-        config_dict["timeseries"]["csv_path"] = str(config.timeseries.csv_path)
+    config_dict = _config_to_summary_dict(config)
 
     summary: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "timeseries",
         "all_converged": passed,
         "config": config_dict,
+        "termination_policy": asdict(config.termination),
+        "termination_hits": int(bool(case and case.termination.hit)),
         "artifacts": {
             "parameter_audit": str(audit_path),
             "timeseries_output_csv": str(output_csv),
@@ -1405,7 +2892,13 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
         stop_warnings = summary.get("warnings", [])
         stop_warnings.append(f"Timeseries fail-fast triggered: {stop_reason}")
         summary["warnings"] = _dedupe_messages(stop_warnings)
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    proxy_warning = _proxy_parameter_warning(config)
+    if proxy_warning:
+        warning_list = summary.get("warnings", [])
+        warning_list.append(proxy_warning)
+        summary["warnings"] = _dedupe_messages(warning_list)
+    _merge_identification_validation(summary, ident_validation, context="timeseries")
+    _write_summary_json(output_dir, summary)
     return summary
 
 
@@ -1416,6 +2909,8 @@ def run_pipeline(config: Config, mode: str = "baseline") -> dict[str, Any]:
         return run_hppc_pipeline(config)
     if mode == "timeseries":
         return run_timeseries_pipeline(config)
+    if mode == "benchmark":
+        return run_benchmark_pipeline(config)
     raise ValueError(f"Unsupported mode: {mode}")
 
 
@@ -1431,12 +2926,12 @@ def run_from_config(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run baseline, HPPC, or timeseries PyBaMM DFN simulations.")
+    parser = argparse.ArgumentParser(description="Run baseline, HPPC, timeseries, or benchmark PyBaMM simulations.")
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
     parser.add_argument("--output-dir", default=None, help="Optional output directory override.")
     parser.add_argument(
         "--mode",
-        choices=["baseline", "hppc", "timeseries"],
+        choices=["baseline", "hppc", "timeseries", "benchmark"],
         default="baseline",
         help="Simulation mode.",
     )

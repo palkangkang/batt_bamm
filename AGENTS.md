@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 ## Project Purpose（本工程目的）
 
@@ -21,6 +21,13 @@
 1. 采用第一性原理思考（First-Principles Thinking），拒绝经验主义与路径盲从。
 2. 代理不得假设用户完全清楚目标；当目标模糊时必须先澄清关键目标与验收标准。
 3. 若目标清晰但路径非最优，代理必须主动提出更短、更低成本方案，并说明主要收益。
+
+## Encoding Contract（编码规范）
+
+1. 全项目文本文件统一使用 `UTF-8` 编码（允许 `UTF-8 BOM`）。
+2. 新建或修改 `Markdown / Python / YAML / JSON / 日志` 文件时，必须显式使用 UTF-8，不得依赖系统默认编码。
+3. 日志读写必须显式指定 `encoding="utf-8"`（如工具链强依赖可使用 `utf-8-sig`）。
+4. 一旦发现乱码，必须先完成转码修复并确认可读，再继续后续编辑与提交。
 
 ## Python 解释器约定
 - 本仓库统一使用 `C:\Users\pal\pyenv\colab` 作为默认 Python 运行环境。
@@ -83,7 +90,7 @@
 
 ```python
 # example logger
-with open("logs/session_2026-03-24.md", "a") as f:
+with open("logs/session_2026-03-24.md", "a", encoding="utf-8") as f:
     f.write(prompt + "\n\n")
     f.write(response + "\n\n")
 ```

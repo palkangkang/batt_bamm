@@ -1,0 +1,81 @@
+﻿chemistry: nmc
+nominal_capacity_ah: 150
+initial_soc: 1.0
+ambient_temp_k: 298.15
+voltage_low_v: 2.8
+voltage_high_v: 4.2
+discharge_rates_c:
+  - 0.2
+  - 0.5
+  - 1.0
+charge_cc_rate: 0.5
+cv_cutoff_c_rate: 0.05
+rest_min: 30
+period_s: 30
+output_dir: outputs/hppc_compare_150ah_nmc_99to1/dfn
+parameter_set: Chen2020
+model:
+  type: dfn
+  thermal: isothermal
+solver:
+  rtol: 1.0e-6
+  atol: 1.0e-8
+quality_gate:
+  enabled: true
+  min_convergence_rate: 0.95
+  max_repeat_delta_final_soc: 5.0e-4
+  max_repeat_delta_min_v: 5.0e-3
+  require_polarization_trend: true
+  enforce: true
+benchmark:
+  enabled: false
+  rates_c: [0.2, 1.0]
+  repeats: 2
+  rest_min: 5
+  charge_cc_rate: 0.5
+  cv_cutoff_c_rate: 0.05
+  period_s: 30
+  profiles: [dfn_nmc, dfn_lfp, ecm_nmc, ecm_lfp]
+identification_inputs:
+  enabled: false
+  strict: true
+  ocv_points_csv: ""
+  cc_cycle_csv: ""
+  hppc_points_csv: ""
+termination:
+  enabled: true
+  logic: any_of
+  must_hit: false
+  apply_to_experiment_modes: true
+  conditions: []
+sanity_gate:
+  enabled: false
+  rate_c: 0.5
+  discharge_to_v: 3.6
+  charge_to_v: 4.1
+  period_s: 30
+hppc:
+  enabled: true
+  soc_start: 0.99
+  soc_end: 0.01
+  soc_step: 0.02
+  pulse_c_rate: 1.0
+  discharge_s: 10
+  charge_s: 5
+  rest_minutes: 30
+  period_s: 1.0
+timeseries:
+  enabled: false
+  csv_path: ""
+  period_s: 0.1
+  use_temp_as_ambient_boundary: false
+  charge_compare:
+    enabled: false
+    soc_start: 0.0
+    rates_c: [0.1, 0.3333333333, 1.0]
+    period_by_rate_s:
+      0.1: 1.0
+      0.3333333333: 0.1
+      1.0: 0.1
+    cv_cutoff_c_rate: 0.05
+    voltage_high_v: 4.2
