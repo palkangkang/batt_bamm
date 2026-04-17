@@ -17,6 +17,8 @@ parameter_set: ECM_Example
 model:
   type: ecm
   thermal: isothermal
+  ecm_rc_elements: 1
+  ecm_fitted_pack_json: ""
 solver:
   rtol: 1.0e-6
   atol: 1.0e-8

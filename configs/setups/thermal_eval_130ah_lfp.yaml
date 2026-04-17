@@ -1,0 +1,46 @@
+base_config_path: ../cells/lfp_130ah/baseline_130ah_lfp.yaml
+sampling_period_s: 1.0
+output_dir: ../../outputs/thermal_eval_130ah_lfp
+cases:
+  - case_id: case01_25c_25c_discharge_0p5c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 25
+    soc_start: 1.0
+    soc_end: 0.0
+    rate_c: 0.5
+  - case_id: case02_25c_25c_discharge_1p0c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 25
+    soc_start: 1.0
+    soc_end: 0.0
+    rate_c: 1.0
+  - case_id: case03_25c_10c_discharge_2p0c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 10
+    soc_start: 1.0
+    soc_end: 0.0
+    rate_c: 2.0
+  - case_id: case04_25c_25c_charge_0p5c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 25
+    soc_start: 0.0
+    soc_end: 1.0
+    rate_c: 0.5
+  - case_id: case05_25c_25c_charge_1p0c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 25
+    soc_start: 0.0
+    soc_end: 1.0
+    rate_c: 1.0
+  - case_id: case06_25c_10c_charge_2p0c
+    ambient_temp_c: 25
+    initial_cell_temp_c: 10
+    soc_start: 0.0
+    soc_end: 1.0
+    rate_c: 2.0
+  - case_id: case07_m20c_m20c_discharge_0p5c
+    ambient_temp_c: -20
+    initial_cell_temp_c: -20
+    soc_start: 1.0
+    soc_end: 0.0
+    rate_c: 0.5

@@ -13,8 +13,10 @@ import yaml
 from scipy.optimize import least_squares
 
 from batt_bamm.hppc_compare import run_compare_pipeline
+from batt_bamm.main import run_from_config
 
 _CURRENT_DYNAMIC_THRESHOLD_A = 1e-6
+_DEFAULT_FIT_TEMPERATURE_GRID_C = [-10.0, 25.0, 45.0]
 _GATE_PROFILE_TARGET = {
     "mae_static_mv": 5.0,
     "mae_dynamic_mv": 20.0,
@@ -283,61 +285,125 @@ def _fit_thevenin_single_window(
 
 def fit_ecm_parameters_from_dfn_hppc(
     *,
-    dfn_hppc_summary_csv: Path,
+    dfn_hppc_summary_csv: Path | None = None,
+    dfn_hppc_summary_csv_by_temp_c: dict[float, Path] | None = None,
     output_dir: Path,
     source_config_path: Path | None = None,
     ecm_order: int = 1,
     loss_dynamic_weight: float = 0.7,
     current_threshold_a: float = _CURRENT_DYNAMIC_THRESHOLD_A,
 ) -> dict[str, Any]:
-    if not dfn_hppc_summary_csv.exists():
-        raise FileNotFoundError(f"DFN HPPC summary CSV not found: {dfn_hppc_summary_csv}")
     if ecm_order not in (1, 2):
         raise ValueError("ecm_order must be 1 or 2.")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = pd.read_csv(dfn_hppc_summary_csv)
-    required = {"soc_target", "passed", "csv_path"}
-    missing = sorted(required - set(summary.columns))
-    if missing:
-        raise ValueError(f"DFN HPPC summary missing required columns: {missing}")
+    if dfn_hppc_summary_csv_by_temp_c is None:
+        if dfn_hppc_summary_csv is None:
+            raise ValueError("Either dfn_hppc_summary_csv or dfn_hppc_summary_csv_by_temp_c must be provided.")
+        dfn_hppc_summary_csv_by_temp_c = {25.0: Path(dfn_hppc_summary_csv)}
+    if len(dfn_hppc_summary_csv_by_temp_c) < 2:
+        raise ValueError("At least two temperatures are required for SOC×temperature ECM fitting.")
 
-    rows = summary.copy()
-    rows["passed"] = rows["passed"].map(_as_bool)
-    rows = rows.loc[rows["passed"]].copy()
-    if rows.empty:
-        raise ValueError("DFN HPPC summary has no passed rows to fit.")
-    rows["soc_target"] = pd.to_numeric(rows["soc_target"], errors="coerce")
-    rows = rows.dropna(subset=["soc_target"])
-    rows = rows.sort_values("soc_target", ascending=False).reset_index(drop=True)
+    datasets: dict[float, Path] = {}
+    for temp_c_raw, summary_csv_raw in dfn_hppc_summary_csv_by_temp_c.items():
+        temp_c = float(temp_c_raw)
+        if not np.isfinite(temp_c):
+            raise ValueError("Fit temperature grid contains non-finite value.")
+        summary_csv = Path(summary_csv_raw)
+        if not summary_csv.exists():
+            raise FileNotFoundError(f"DFN HPPC summary CSV not found for {temp_c}°C: {summary_csv}")
+        datasets[temp_c] = summary_csv.resolve()
 
     fitted_points: list[dict[str, Any]] = []
-    for item in rows.to_dict(orient="records"):
-        csv_path = _to_path(item.get("csv_path"), base_dir=dfn_hppc_summary_csv.parent)
-        if csv_path is None or not csv_path.exists():
-            raise FileNotFoundError(f"HPPC point csv_path is invalid: {item.get('csv_path')}")
-        point_frame = pd.read_csv(csv_path)
-        fit_window = _extract_discharge_window(point_frame)
-        soc_target = float(item["soc_target"])
-        point_fit = _fit_thevenin_single_window(
-            fit_window,
-            soc_target=soc_target,
-            ecm_order=ecm_order,
-            loss_dynamic_weight=loss_dynamic_weight,
-            current_threshold_a=current_threshold_a,
-        )
-        point_fit["csv_path"] = str(csv_path)
-        fitted_points.append(point_fit)
+    required = {"soc_target", "passed", "csv_path"}
+    for temp_c in sorted(datasets.keys()):
+        summary_csv = datasets[temp_c]
+        summary = pd.read_csv(summary_csv)
+        missing = sorted(required - set(summary.columns))
+        if missing:
+            raise ValueError(f"DFN HPPC summary missing required columns at {temp_c}°C: {missing}")
 
-    fit_points = pd.DataFrame(fitted_points).sort_values("soc_target", ascending=False).reset_index(drop=True)
+        rows = summary.copy()
+        rows["passed"] = rows["passed"].map(_as_bool)
+        rows = rows.loc[rows["passed"]].copy()
+        if rows.empty:
+            raise ValueError(f"DFN HPPC summary has no passed rows at {temp_c}°C.")
+        rows["soc_target"] = pd.to_numeric(rows["soc_target"], errors="coerce")
+        rows = rows.dropna(subset=["soc_target"])
+        rows = rows.sort_values("soc_target", ascending=False).reset_index(drop=True)
+
+        for item in rows.to_dict(orient="records"):
+            csv_path = _to_path(item.get("csv_path"), base_dir=summary_csv.parent)
+            if csv_path is None or not csv_path.exists():
+                raise FileNotFoundError(f"HPPC point csv_path is invalid at {temp_c}°C: {item.get('csv_path')}")
+            point_frame = pd.read_csv(csv_path)
+            fit_window = _extract_discharge_window(point_frame)
+            soc_target = float(item["soc_target"])
+            point_fit = _fit_thevenin_single_window(
+                fit_window,
+                soc_target=soc_target,
+                ecm_order=ecm_order,
+                loss_dynamic_weight=loss_dynamic_weight,
+                current_threshold_a=current_threshold_a,
+            )
+            point_fit["csv_path"] = str(csv_path)
+            point_fit["temp_c"] = float(temp_c)
+            fitted_points.append(point_fit)
+
+    fit_points = pd.DataFrame(fitted_points).sort_values(["temp_c", "soc_target"], ascending=[True, False]).reset_index(drop=True)
     suffix = "_2rc" if ecm_order == 2 else ""
-    fit_points_path = output_dir / f"ecm_fit_points{suffix}.csv"
+    fit_points_path = output_dir / f"ecm_fit_points_temp_2d{suffix}.csv"
     fit_points.to_csv(fit_points_path, index=False)
 
-    packed = fit_points.sort_values("soc_target", ascending=True).reset_index(drop=True)
+    temp_axis = sorted(float(value) for value in fit_points["temp_c"].dropna().unique().tolist())
+    soc_sets = []
+    for temp_c in temp_axis:
+        group = fit_points.loc[np.isclose(fit_points["temp_c"], temp_c, atol=1e-10), "soc_target"]
+        tokens = {round(float(v), 10) for v in group.to_numpy(dtype=float)}
+        soc_sets.append(tokens)
+    common_soc_tokens = set.intersection(*soc_sets) if soc_sets else set()
+    if not common_soc_tokens:
+        raise ValueError("No common SOC grid across temperature datasets for 2-D ECM fit pack.")
+    soc_axis = sorted(float(v) for v in common_soc_tokens)
+
+    aligned_rows: list[dict[str, Any]] = []
+    for temp_c in temp_axis:
+        rows_temp = fit_points.loc[np.isclose(fit_points["temp_c"], temp_c, atol=1e-10)].copy()
+        rows_temp["_soc_token"] = rows_temp["soc_target"].round(10)
+        rows_temp = rows_temp.loc[rows_temp["_soc_token"].isin(common_soc_tokens)].copy()
+        rows_temp = rows_temp.sort_values("_soc_token", ascending=True).drop_duplicates(subset=["_soc_token"], keep="first")
+        if len(rows_temp) != len(soc_axis):
+            raise ValueError(f"SOC alignment failed at {temp_c}°C for 2-D ECM fit pack.")
+        aligned_rows.extend(rows_temp.to_dict(orient="records"))
+    aligned = pd.DataFrame(aligned_rows).sort_values(["temp_c", "soc_target"]).reset_index(drop=True)
+
+    def _build_map(column: str) -> np.ndarray:
+        matrix = np.empty((len(temp_axis), len(soc_axis)), dtype=float)
+        for i, temp_c in enumerate(temp_axis):
+            group = aligned.loc[np.isclose(aligned["temp_c"], temp_c, atol=1e-10)].copy()
+            group = group.sort_values("soc_target", ascending=True).reset_index(drop=True)
+            values = group[column].to_numpy(dtype=float)
+            if values.size != len(soc_axis):
+                raise ValueError(f"Map build failed for {column} at {temp_c}°C.")
+            matrix[i, :] = values
+        return matrix
+
+    r0_map = _build_map("r0_ohm")
+    r1_map = _build_map("r1_ohm")
+    c1_map = _build_map("c1_f")
+    if ecm_order == 2:
+        r2_map = _build_map("r2_ohm")
+        c2_map = _build_map("c2_f")
+
+    reference_temp_for_ocv = min(temp_axis, key=lambda value: abs(value - 25.0))
+    ref_group = aligned.loc[np.isclose(aligned["temp_c"], reference_temp_for_ocv, atol=1e-10)].copy()
+    ref_group = ref_group.sort_values("soc_target", ascending=True).reset_index(drop=True)
+    ocv_v = ref_group["ocv_v"].to_numpy(dtype=float)
+
     pack_payload: dict[str, Any] = {
+        "schema_version": "ecm_temp_2d_v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "source_hppc_summary_csv": str(dfn_hppc_summary_csv.resolve()),
+        "source_hppc_summary_csv_by_temp_c": {str(temp_c): str(path) for temp_c, path in datasets.items()},
         "source_config_path": None if source_config_path is None else str(source_config_path.resolve()),
         "model": f"thevenin_{ecm_order}rc",
         "ecm_order": int(ecm_order),
@@ -345,33 +411,38 @@ def fit_ecm_parameters_from_dfn_hppc(
             "loss_dynamic_weight": float(loss_dynamic_weight),
             "loss_static_weight": float(1.0 - loss_dynamic_weight),
             "current_dynamic_threshold_a": float(current_threshold_a),
+            "fit_temperature_grid_c": [float(temp) for temp in temp_axis],
         },
-        "soc": [float(v) for v in packed["soc_target"].to_numpy(dtype=float)],
-        "ocv_v": [float(v) for v in packed["ocv_v"].to_numpy(dtype=float)],
-        "r0_ohm": [float(v) for v in packed["r0_ohm"].to_numpy(dtype=float)],
-        "r1_ohm": [float(v) for v in packed["r1_ohm"].to_numpy(dtype=float)],
-        "c1_f": [float(v) for v in packed["c1_f"].to_numpy(dtype=float)],
+        "soc_axis": [float(v) for v in soc_axis],
+        "temp_c_axis": [float(v) for v in temp_axis],
+        "ocv_v": [float(v) for v in ocv_v],
+        "r0_ohm_map": r0_map.tolist(),
+        "r1_ohm_map": r1_map.tolist(),
+        "c1_f_map": c1_map.tolist(),
         "fit_metrics": {
-            "point_count": int(len(packed)),
-            "mean_rmse_v": float(np.mean(packed["rmse_v"].to_numpy(dtype=float))),
-            "max_rmse_v": float(np.max(packed["rmse_v"].to_numpy(dtype=float))),
-            "mean_mae_v": float(np.mean(packed["mae_v"].to_numpy(dtype=float))),
-            "max_mae_v": float(np.max(packed["mae_v"].to_numpy(dtype=float))),
-            "mean_mae_static_v": _nan_agg(packed["mae_static_v"].to_numpy(dtype=float), "mean"),
-            "mean_mae_dynamic_v": _nan_agg(packed["mae_dynamic_v"].to_numpy(dtype=float), "mean"),
-            "max_p95_dynamic_v": _nan_agg(packed["p95_dynamic_v"].to_numpy(dtype=float), "max"),
+            "point_count": int(len(aligned)),
+            "temperature_count": int(len(temp_axis)),
+            "soc_count": int(len(soc_axis)),
+            "mean_rmse_v": float(np.mean(aligned["rmse_v"].to_numpy(dtype=float))),
+            "max_rmse_v": float(np.max(aligned["rmse_v"].to_numpy(dtype=float))),
+            "mean_mae_v": float(np.mean(aligned["mae_v"].to_numpy(dtype=float))),
+            "max_mae_v": float(np.max(aligned["mae_v"].to_numpy(dtype=float))),
+            "mean_mae_static_v": _nan_agg(aligned["mae_static_v"].to_numpy(dtype=float), "mean"),
+            "mean_mae_dynamic_v": _nan_agg(aligned["mae_dynamic_v"].to_numpy(dtype=float), "mean"),
+            "max_p95_dynamic_v": _nan_agg(aligned["p95_dynamic_v"].to_numpy(dtype=float), "max"),
         },
     }
     if ecm_order == 2:
-        pack_payload["r2_ohm"] = [float(v) for v in packed["r2_ohm"].to_numpy(dtype=float)]
-        pack_payload["c2_f"] = [float(v) for v in packed["c2_f"].to_numpy(dtype=float)]
-    pack_path = output_dir / f"ecm_fitted_pack{suffix}.json"
+        pack_payload["r2_ohm_map"] = r2_map.tolist()
+        pack_payload["c2_f_map"] = c2_map.tolist()
+    pack_path = output_dir / f"ecm_fitted_pack_temp_2d{suffix}.json"
     pack_path.write_text(json.dumps(pack_payload, indent=2), encoding="utf-8")
 
     return {
         "fit_points_csv": str(fit_points_path),
         "fitted_pack_json": str(pack_path),
         "fit_metrics": pack_payload["fit_metrics"],
+        "fit_temperature_grid_c": [float(value) for value in temp_axis],
     }
 
 
@@ -385,6 +456,59 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _normalize_fit_temperature_grid(fit_temperature_grid_c: list[float] | None) -> list[float]:
+    source = _DEFAULT_FIT_TEMPERATURE_GRID_C if fit_temperature_grid_c is None else fit_temperature_grid_c
+    if not source:
+        raise ValueError("fit_temperature_grid_c must not be empty.")
+    normalized = []
+    for temp in source:
+        value = float(temp)
+        if not np.isfinite(value):
+            raise ValueError("fit_temperature_grid_c contains non-finite value.")
+        normalized.append(value)
+    unique_sorted = sorted({round(value, 10) for value in normalized})
+    if len(unique_sorted) < 2:
+        raise ValueError("fit_temperature_grid_c must contain at least two distinct temperatures.")
+    return [float(v) for v in unique_sorted]
+
+
+def _temp_tag(temp_c: float) -> str:
+    token = f"{temp_c:.2f}".replace(".", "p").replace("-", "m")
+    return f"{token}c"
+
+
+def _run_dfn_hppc_for_fit_temperature(
+    *,
+    dfn_config_path: Path,
+    output_dir: Path,
+    fit_temperature_grid_c: list[float],
+) -> dict[float, Path]:
+    fit_inputs_dir = output_dir / "_generated_configs" / "fit_inputs"
+    fit_inputs_dir.mkdir(parents=True, exist_ok=True)
+    dfn_template = _read_yaml(dfn_config_path)
+    if not isinstance(dfn_template.get("model", {}), dict) or str(dfn_template["model"].get("type", "dfn")).strip().lower() != "dfn":
+        raise ValueError("dfn-config must contain model.type=dfn.")
+
+    summary_by_temp: dict[float, Path] = {}
+    for temp_c in fit_temperature_grid_c:
+        temp_k = float(temp_c + 273.15)
+        cfg = json.loads(json.dumps(dfn_template))
+        cfg["ambient_temp_k"] = temp_k
+        cfg["initial_cell_temp_k"] = temp_k
+        cfg["output_dir"] = str((output_dir / "fit_inputs" / f"dfn_hppc_{_temp_tag(temp_c)}").resolve())
+        cfg_path = fit_inputs_dir / f"dfn_hppc_{_temp_tag(temp_c)}.yaml"
+        _write_yaml(cfg_path, cfg)
+        run = run_from_config(config_path=cfg_path, mode="hppc")
+        if not bool(run.get("all_converged", False)):
+            stop_reason = str(run.get("hppc", {}).get("stop_reason") or "unknown")
+            raise ValueError(f"DFN HPPC fit input failed at {temp_c}°C: {stop_reason}")
+        summary_csv = _to_path(run.get("artifacts", {}).get("hppc_summary_csv"), base_dir=cfg_path.parent)
+        if summary_csv is None or not summary_csv.exists():
+            raise ValueError(f"Missing DFN hppc_summary_csv artifact at {temp_c}°C.")
+        summary_by_temp[float(temp_c)] = summary_csv.resolve()
+    return summary_by_temp
 
 
 def _prepare_compare_configs(
@@ -675,6 +799,7 @@ def run_ecm_fit_compare_pipeline(
     improve_threshold: float = 0.2,
     ecm_order: int = 1,
     loss_dynamic_weight: float = 0.7,
+    fit_temperature_grid_c: list[float] | None = None,
     gate_profile: str = "target",
     cell_id: str = "150Ah_NMC",
 ) -> dict[str, Any]:
@@ -685,6 +810,7 @@ def run_ecm_fit_compare_pipeline(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     gate_thresholds = _resolve_gate_thresholds(gate_profile)
+    normalized_temp_grid_c = _normalize_fit_temperature_grid(fit_temperature_grid_c)
     suffix = "_2rc" if ecm_order == 2 else ""
 
     dfn_before_cfg, ecm_before_cfg = _prepare_compare_configs(
@@ -703,9 +829,11 @@ def run_ecm_fit_compare_pipeline(
         cell_id=cell_id,
     )
 
-    dfn_hppc_summary_csv = _to_path(before.get("dfn_run", {}).get("hppc_summary_csv"), base_dir=compare_before_dir)
-    if dfn_hppc_summary_csv is None:
-        raise ValueError("Baseline compare did not expose DFN hppc_summary_csv path.")
+    dfn_hppc_summary_csv_by_temp_c = _run_dfn_hppc_for_fit_temperature(
+        dfn_config_path=dfn_config_path,
+        output_dir=output_dir,
+        fit_temperature_grid_c=normalized_temp_grid_c,
+    )
     fit_output_dir = output_dir / "fit"
     compare_after_dir = output_dir / "compare_after"
     fit_result: dict[str, Any] | None = None
@@ -714,7 +842,7 @@ def run_ecm_fit_compare_pipeline(
     setup_error: str | None = None
     try:
         fit_result = fit_ecm_parameters_from_dfn_hppc(
-            dfn_hppc_summary_csv=dfn_hppc_summary_csv,
+            dfn_hppc_summary_csv_by_temp_c=dfn_hppc_summary_csv_by_temp_c,
             output_dir=fit_output_dir,
             source_config_path=dfn_config_path,
             ecm_order=ecm_order,
@@ -807,6 +935,7 @@ def run_ecm_fit_compare_pipeline(
         "threshold": float(improve_threshold),
         "ecm_order": int(ecm_order),
         "loss_dynamic_weight": float(loss_dynamic_weight),
+        "fit_temperature_grid_c": [float(v) for v in normalized_temp_grid_c],
         "gate_profile": gate_profile,
         "baseline_metrics": before.get("metrics", {}),
         "optimized_metrics": after.get("metrics", {}),
@@ -820,6 +949,10 @@ def run_ecm_fit_compare_pipeline(
             "ecm_fit_points_csv": None
             if fit_result is None
             else str(Path(fit_result["fit_points_csv"]).resolve()),
+            "dfn_hppc_summary_csv_by_temp_c": {
+                str(temp_c): str(path)
+                for temp_c, path in dfn_hppc_summary_csv_by_temp_c.items()
+            },
             "compare_before_summary_json": str(compare_before_dir / "hppc_compare_summary.json"),
             "compare_after_summary_json": str(compare_after_dir / "hppc_compare_summary.json"),
             "ecm_fit_compare_summary_json": str(output_dir / f"ecm_fit_compare_summary{suffix}.json"),
@@ -857,6 +990,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Dynamic segment weight in weighted fitting loss (0~1).",
     )
     parser.add_argument(
+        "--fit-temperature-grid-c",
+        nargs="+",
+        type=float,
+        default=[-10.0, 25.0, 45.0],
+        help="Temperature grid (degC) for DFN HPPC fitting inputs, e.g. -10 25 45.",
+    )
+    parser.add_argument(
         "--gate-profile",
         default="target",
         choices=["off", "target"],
@@ -875,6 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
         improve_threshold=float(args.improve_threshold),
         ecm_order=int(args.ecm_order),
         loss_dynamic_weight=float(args.loss_dynamic_weight),
+        fit_temperature_grid_c=list(args.fit_temperature_grid_c),
         gate_profile=str(args.gate_profile),
         cell_id=str(args.cell_id),
     )

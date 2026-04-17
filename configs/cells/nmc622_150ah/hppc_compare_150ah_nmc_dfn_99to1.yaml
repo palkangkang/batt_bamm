@@ -16,7 +16,14 @@ output_dir: outputs/hppc_compare_150ah_nmc_99to1/dfn
 parameter_set: Chen2020
 model:
   type: dfn
-  thermal: isothermal
+  thermal: lumped
+  thermal_coupling:
+    enabled: false
+    boundary_mode: constant
+  thermal_params:
+    total_heat_transfer_coefficient_w_m2_k: 120.0
+    cell_volume_m3: 0.000726
+    cell_cooling_surface_area_m2: 0.0512674863
 solver:
   rtol: 1.0e-6
   atol: 1.0e-8
@@ -47,7 +54,15 @@ termination:
   logic: any_of
   must_hit: false
   apply_to_experiment_modes: true
-  conditions: []
+  conditions:
+    - metric: cell_temperature_k
+      op: ">="
+      threshold: 333.15
+      name: cell_temp_limit_60c
+    - metric: boundary_temperature_k
+      op: ">="
+      threshold: 323.15
+      name: boundary_temp_limit_50c
 sanity_gate:
   enabled: false
   rate_c: 0.5

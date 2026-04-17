@@ -16,7 +16,19 @@ output_dir: outputs/baseline_150ah_nmc622
 parameter_set: Chen2020
 model:
   type: dfn
-  thermal: isothermal
+  thermal: lumped
+  thermal_coupling:
+    enabled: false
+    boundary_mode: constant
+  thermal_params:
+    total_heat_transfer_coefficient_w_m2_k: 120.0
+    cell_volume_m3: 0.000726
+    cell_cooling_surface_area_m2: 0.0512674863
+  temperature_dependence:
+    dfn:
+      enabled: false
+      reference_temp_k: 298.15
+      arrhenius_overrides: {}
 solver:
   rtol: 1.0e-6
   atol: 1.0e-8
@@ -53,7 +65,15 @@ termination:
   logic: any_of
   must_hit: false
   apply_to_experiment_modes: true
-  conditions: []
+  conditions:
+    - metric: cell_temperature_k
+      op: ">="
+      threshold: 333.15
+      name: cell_temp_limit_60c
+    - metric: boundary_temperature_k
+      op: ">="
+      threshold: 323.15
+      name: boundary_temp_limit_50c
 sanity_gate:
   enabled: true
   rate_c: 0.5
@@ -75,6 +95,15 @@ timeseries:
   csv_path: ""
   period_s: 0.1
   use_temp_as_ambient_boundary: false
+  soc_switch_approx:
+    enabled: false
+    soc_start: 0.99
+    discharge_rate_c: 1.0
+    discharge_to_soc: 0.30
+    charge_rate_c: 1.0
+    charge_to_soc: 0.90
+    period_s: 0.1
+    temp_k: 298.15
   charge_compare:
     enabled: true
     soc_start: 0.0

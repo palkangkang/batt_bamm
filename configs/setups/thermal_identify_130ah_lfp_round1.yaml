@@ -1,0 +1,30 @@
+base_config_path: ../cells/lfp_130ah/baseline_130ah_lfp.yaml
+short_eval_config_path: thermal_eval_130ah_lfp_short_regression.yaml
+long_eval_config_path: thermal_eval_130ah_lfp_long_representative.yaml
+output_dir: ../../outputs/thermal_identify_130ah_lfp_round1
+
+target:
+  short_summary_json: ../../outputs/thermal_eval_130ah_lfp_short_regression/thermal_eval_summary.json
+  long_summary_json: ../../outputs/thermal_eval_130ah_lfp_long_representative/thermal_eval_summary.json
+  bootstrap_if_missing: true
+
+fit:
+  max_nfev: 8
+  initial_guess:
+    total_heat_transfer_coefficient_w_m2_k: 120.0
+    heat_capacity_scale: 1.0
+    thermal_conductivity_scale: 1.0
+  lower_bounds:
+    total_heat_transfer_coefficient_w_m2_k: 40.0
+    heat_capacity_scale: 0.6
+    thermal_conductivity_scale: 0.6
+  upper_bounds:
+    total_heat_transfer_coefficient_w_m2_k: 300.0
+    heat_capacity_scale: 1.8
+    thermal_conductivity_scale: 1.8
+  weights:
+    cell_temperature: 1.0
+    boundary_temperature: 0.3
+
+output:
+  write_round_config: true

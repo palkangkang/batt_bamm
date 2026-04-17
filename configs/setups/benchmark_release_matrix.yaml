@@ -16,6 +16,9 @@ parameter_set: Chen2020
 model:
   type: dfn
   thermal: isothermal
+  thermal_coupling:
+    enabled: false
+    boundary_mode: constant
 solver:
   rtol: 1.0e-6
   atol: 1.0e-8
@@ -74,6 +77,15 @@ timeseries:
   csv_path: ""
   period_s: 0.1
   use_temp_as_ambient_boundary: false
+  soc_switch_approx:
+    enabled: false
+    soc_start: 0.99
+    discharge_rate_c: 1.0
+    discharge_to_soc: 0.30
+    charge_rate_c: 1.0
+    charge_to_soc: 0.90
+    period_s: 0.1
+    temp_k: 298.15
   charge_compare:
     enabled: false
     soc_start: 0.0

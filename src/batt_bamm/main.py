@@ -23,10 +23,62 @@ _WARNING_TOKENS = ("infeasible at initial conditions", "skipping step")
 _ALLOWED_MODEL_TYPES = {"dfn", "ecm"}
 _ALLOWED_CHEMISTRY = {"nmc", "lfp"}
 _ALLOWED_THERMAL = {"isothermal", "lumped"}
+_ALLOWED_THERMAL_BOUNDARY_MODES = {"constant", "timeseries"}
 _ALLOWED_ECM_RC_ELEMENTS = {1, 2}
-_ALLOWED_TERMINATION_METRICS = {"time_s", "voltage_v", "soc", "current_abs_a", "temperature_k", "ocv_v"}
+_ALLOWED_TERMINATION_METRICS = {
+    "time_s",
+    "voltage_v",
+    "soc",
+    "current_abs_a",
+    "cell_temperature_k",
+    "boundary_temperature_k",
+    "ocv_v",
+}
 _ALLOWED_TERMINATION_OPS = {">=", "<="}
-_CONTRACT_VERSION = "1.1.0"
+_THERMAL_PARAM_TO_PYBAMM_KEY = {
+    "total_heat_transfer_coefficient_w_m2_k": "Total heat transfer coefficient [W.m-2.K-1]",
+    "cell_volume_m3": "Cell volume [m3]",
+    "cell_cooling_surface_area_m2": "Cell cooling surface area [m2]",
+}
+_THERMAL_HEAT_CAPACITY_PARAMETER_KEYS = (
+    "Negative current collector specific heat capacity [J.kg-1.K-1]",
+    "Positive current collector specific heat capacity [J.kg-1.K-1]",
+    "Negative electrode specific heat capacity [J.kg-1.K-1]",
+    "Positive electrode specific heat capacity [J.kg-1.K-1]",
+    "Separator specific heat capacity [J.kg-1.K-1]",
+)
+_THERMAL_CONDUCTIVITY_PARAMETER_KEYS = (
+    "Negative current collector thermal conductivity [W.m-1.K-1]",
+    "Positive current collector thermal conductivity [W.m-1.K-1]",
+    "Negative electrode thermal conductivity [W.m-1.K-1]",
+    "Positive electrode thermal conductivity [W.m-1.K-1]",
+    "Separator thermal conductivity [W.m-1.K-1]",
+)
+_LFP_LUMPED_PROXY_PARAMETER_KEYS = (
+    "Negative current collector thickness [m]",
+    "Negative current collector conductivity [S.m-1]",
+    "Positive current collector thickness [m]",
+    "Positive current collector conductivity [S.m-1]",
+    "Negative current collector density [kg.m-3]",
+    "Negative current collector specific heat capacity [J.kg-1.K-1]",
+    "Negative electrode density [kg.m-3]",
+    "Negative electrode specific heat capacity [J.kg-1.K-1]",
+    "Separator density [kg.m-3]",
+    "Separator specific heat capacity [J.kg-1.K-1]",
+    "Positive electrode density [kg.m-3]",
+    "Positive electrode specific heat capacity [J.kg-1.K-1]",
+    "Positive current collector density [kg.m-3]",
+    "Positive current collector specific heat capacity [J.kg-1.K-1]",
+)
+_LFP_LUMPED_PROXY_SOURCE_SET = "Chen2020"
+_DFN_ARRHENIUS_PARAMETER_MAP = {
+    "negative_particle_diffusivity_ea_j_mol": "Negative particle diffusivity [m2.s-1]",
+    "positive_particle_diffusivity_ea_j_mol": "Positive particle diffusivity [m2.s-1]",
+    "negative_exchange_current_ea_j_mol": "Negative electrode exchange-current density [A.m-2]",
+    "positive_exchange_current_ea_j_mol": "Positive electrode exchange-current density [A.m-2]",
+}
+_ECM_TEMP_PACK_SCHEMA_VERSION = "ecm_temp_2d_v1"
+_CONTRACT_VERSION = "3.0.0"
 _STABLE_SUMMARY_FIELDS = {
     "contract_version",
     "contract_fields",
@@ -89,12 +141,65 @@ class ChargeCompareConfig:
 
 
 @dataclass(frozen=True)
+class SocSwitchApproxConfig:
+    enabled: bool = False
+    soc_start: float | None = None
+    discharge_rate_c: float = 1.0
+    discharge_to_soc: float = 0.30
+    charge_rate_c: float = 1.0
+    charge_to_soc: float = 0.90
+    period_s: float = 0.1
+    temp_k: float | None = None
+
+
+@dataclass(frozen=True)
 class TimeseriesSuiteConfig:
     enabled: bool = False
     csv_path: Path | None = None
     period_s: float | None = None
     use_temp_as_ambient_boundary: bool = False
+    allow_early_stop: bool = False
     charge_compare: ChargeCompareConfig = field(default_factory=ChargeCompareConfig)
+    soc_switch_approx: SocSwitchApproxConfig = field(default_factory=SocSwitchApproxConfig)
+
+
+@dataclass(frozen=True)
+class ThermalCouplingConfig:
+    enabled: bool = False
+    boundary_mode: str = "constant"
+
+
+@dataclass(frozen=True)
+class ThermalParamsConfig:
+    total_heat_transfer_coefficient_w_m2_k: float | None = None
+    cell_volume_m3: float | None = None
+    cell_cooling_surface_area_m2: float | None = None
+
+
+@dataclass(frozen=True)
+class ThermalPropertyScaleConfig:
+    heat_capacity_scale: float = 1.0
+    thermal_conductivity_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class DfnArrheniusOverridesConfig:
+    negative_particle_diffusivity_ea_j_mol: float | None = None
+    positive_particle_diffusivity_ea_j_mol: float | None = None
+    negative_exchange_current_ea_j_mol: float | None = None
+    positive_exchange_current_ea_j_mol: float | None = None
+
+
+@dataclass(frozen=True)
+class DfnTemperatureDependenceConfig:
+    enabled: bool = False
+    reference_temp_k: float = 298.15
+    arrhenius_overrides: DfnArrheniusOverridesConfig = field(default_factory=DfnArrheniusOverridesConfig)
+
+
+@dataclass(frozen=True)
+class TemperatureDependenceConfig:
+    dfn: DfnTemperatureDependenceConfig = field(default_factory=DfnTemperatureDependenceConfig)
 
 
 @dataclass(frozen=True)
@@ -177,6 +282,7 @@ class Config:
     nominal_capacity_ah: float
     initial_soc: float
     ambient_temp_k: float
+    initial_cell_temp_k: float
     voltage_low_v: float
     voltage_high_v: float
     discharge_rates_c: list[float]
@@ -186,6 +292,10 @@ class Config:
     output_dir: Path
     parameter_set: str = "Chen2020"
     thermal: str = "isothermal"
+    thermal_coupling: ThermalCouplingConfig = field(default_factory=ThermalCouplingConfig)
+    thermal_params: ThermalParamsConfig = field(default_factory=ThermalParamsConfig)
+    thermal_property_scales: ThermalPropertyScaleConfig = field(default_factory=ThermalPropertyScaleConfig)
+    temperature_dependence: TemperatureDependenceConfig = field(default_factory=TemperatureDependenceConfig)
     ecm_rc_elements: int = 1
     ecm_fitted_pack_json: Path | None = None
     period_s: int = 30
@@ -432,10 +542,16 @@ def _should_retry_with_casadi(config: Config, error: str | None) -> bool:
         return False
     token = str(error).lower()
     return (
-        "ida_err_fail" in token
+        "ida_conv_fail" in token
+        or "ida_err_fail" in token
         or "error test failures occurred too many times" in token
         or "minimum step size was reached" in token
+        or "corrector convergence failed repeatedly" in token
     )
+
+
+def _prefer_casadi_primary_solver(config: Config) -> bool:
+    return bool(config.model_type == "dfn" and config.chemistry == "lfp" and config.thermal == "lumped")
 
 
 def _case_id(rate_c: float) -> str:
@@ -499,6 +615,18 @@ def _resolve_optional_path(raw_value: Any, base_dir: Path) -> Path | None:
     return candidate
 
 
+def _parse_optional_positive_float(raw: dict[str, Any], key: str, *, field_label: str) -> float | None:
+    if key not in raw or raw.get(key) is None:
+        return None
+    try:
+        value = float(raw[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_label} must be a positive number when provided.") from exc
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_label} must be a positive finite number when provided.")
+    return value
+
+
 def load_config(config_path: str | Path) -> Config:
     config_path = Path(config_path)
     with config_path.open("r", encoding="utf-8") as handle:
@@ -523,10 +651,130 @@ def load_config(config_path: str | Path) -> Config:
     chemistry = str(raw.get("chemistry", "nmc")).strip().lower()
     if chemistry not in _ALLOWED_CHEMISTRY:
         raise ValueError(f"chemistry must be one of {sorted(_ALLOWED_CHEMISTRY)}")
+    ambient_temp_k = float(raw["ambient_temp_k"])
+    initial_cell_temp_k = float(raw.get("initial_cell_temp_k", ambient_temp_k))
+    if not np.isfinite(initial_cell_temp_k) or initial_cell_temp_k <= 0:
+        raise ValueError("initial_cell_temp_k must be a positive finite number when provided.")
 
     thermal = str(model_raw.get("thermal", "isothermal")).strip().lower()
     if thermal not in _ALLOWED_THERMAL:
         raise ValueError(f"model.thermal must be one of {sorted(_ALLOWED_THERMAL)}")
+    thermal_coupling_raw = model_raw.get("thermal_coupling", {})
+    if thermal_coupling_raw is None:
+        thermal_coupling_raw = {}
+    if not isinstance(thermal_coupling_raw, dict):
+        raise ValueError("model.thermal_coupling must be a mapping when provided.")
+
+    legacy_timeseries_boundary = bool(timeseries_raw.get("use_temp_as_ambient_boundary", False))
+    if not thermal_coupling_raw and legacy_timeseries_boundary:
+        thermal_coupling_enabled = True
+        thermal_boundary_mode = "timeseries"
+    else:
+        thermal_coupling_enabled = bool(thermal_coupling_raw.get("enabled", False))
+        thermal_boundary_mode = str(thermal_coupling_raw.get("boundary_mode", "constant")).strip().lower()
+    if thermal_boundary_mode not in _ALLOWED_THERMAL_BOUNDARY_MODES:
+        raise ValueError(
+            f"model.thermal_coupling.boundary_mode must be one of {sorted(_ALLOWED_THERMAL_BOUNDARY_MODES)}"
+        )
+    thermal_params_raw = model_raw.get("thermal_params", {})
+    if thermal_params_raw is None:
+        thermal_params_raw = {}
+    if not isinstance(thermal_params_raw, dict):
+        raise ValueError("model.thermal_params must be a mapping when provided.")
+    thermal_params = ThermalParamsConfig(
+        total_heat_transfer_coefficient_w_m2_k=_parse_optional_positive_float(
+            thermal_params_raw,
+            "total_heat_transfer_coefficient_w_m2_k",
+            field_label="model.thermal_params.total_heat_transfer_coefficient_w_m2_k",
+        ),
+        cell_volume_m3=_parse_optional_positive_float(
+            thermal_params_raw,
+            "cell_volume_m3",
+            field_label="model.thermal_params.cell_volume_m3",
+        ),
+        cell_cooling_surface_area_m2=_parse_optional_positive_float(
+            thermal_params_raw,
+            "cell_cooling_surface_area_m2",
+            field_label="model.thermal_params.cell_cooling_surface_area_m2",
+        ),
+    )
+    thermal_property_scales_raw = model_raw.get("thermal_property_scales", {})
+    if thermal_property_scales_raw is None:
+        thermal_property_scales_raw = {}
+    if not isinstance(thermal_property_scales_raw, dict):
+        raise ValueError("model.thermal_property_scales must be a mapping when provided.")
+    heat_capacity_scale = float(thermal_property_scales_raw.get("heat_capacity_scale", 1.0))
+    thermal_conductivity_scale = float(thermal_property_scales_raw.get("thermal_conductivity_scale", 1.0))
+    if not np.isfinite(heat_capacity_scale) or heat_capacity_scale <= 0:
+        raise ValueError("model.thermal_property_scales.heat_capacity_scale must be a positive finite number.")
+    if not np.isfinite(thermal_conductivity_scale) or thermal_conductivity_scale <= 0:
+        raise ValueError(
+            "model.thermal_property_scales.thermal_conductivity_scale must be a positive finite number."
+        )
+    thermal_property_scales = ThermalPropertyScaleConfig(
+        heat_capacity_scale=heat_capacity_scale,
+        thermal_conductivity_scale=thermal_conductivity_scale,
+    )
+    temperature_dependence_raw = model_raw.get("temperature_dependence", {})
+    if temperature_dependence_raw is None:
+        temperature_dependence_raw = {}
+    if not isinstance(temperature_dependence_raw, dict):
+        raise ValueError("model.temperature_dependence must be a mapping when provided.")
+    dfn_temp_raw = temperature_dependence_raw.get("dfn", {})
+    if dfn_temp_raw is None:
+        dfn_temp_raw = {}
+    if not isinstance(dfn_temp_raw, dict):
+        raise ValueError("model.temperature_dependence.dfn must be a mapping when provided.")
+    arrhenius_overrides_raw = dfn_temp_raw.get("arrhenius_overrides", {})
+    if arrhenius_overrides_raw is None:
+        arrhenius_overrides_raw = {}
+    if not isinstance(arrhenius_overrides_raw, dict):
+        raise ValueError("model.temperature_dependence.dfn.arrhenius_overrides must be a mapping.")
+    dfn_reference_temp_k = float(dfn_temp_raw.get("reference_temp_k", 298.15))
+    if not np.isfinite(dfn_reference_temp_k) or dfn_reference_temp_k <= 0:
+        raise ValueError("model.temperature_dependence.dfn.reference_temp_k must be a positive finite number.")
+    dfn_arrhenius_overrides = DfnArrheniusOverridesConfig(
+        negative_particle_diffusivity_ea_j_mol=_parse_optional_positive_float(
+            arrhenius_overrides_raw,
+            "negative_particle_diffusivity_ea_j_mol",
+            field_label=(
+                "model.temperature_dependence.dfn.arrhenius_overrides."
+                "negative_particle_diffusivity_ea_j_mol"
+            ),
+        ),
+        positive_particle_diffusivity_ea_j_mol=_parse_optional_positive_float(
+            arrhenius_overrides_raw,
+            "positive_particle_diffusivity_ea_j_mol",
+            field_label=(
+                "model.temperature_dependence.dfn.arrhenius_overrides."
+                "positive_particle_diffusivity_ea_j_mol"
+            ),
+        ),
+        negative_exchange_current_ea_j_mol=_parse_optional_positive_float(
+            arrhenius_overrides_raw,
+            "negative_exchange_current_ea_j_mol",
+            field_label=(
+                "model.temperature_dependence.dfn.arrhenius_overrides."
+                "negative_exchange_current_ea_j_mol"
+            ),
+        ),
+        positive_exchange_current_ea_j_mol=_parse_optional_positive_float(
+            arrhenius_overrides_raw,
+            "positive_exchange_current_ea_j_mol",
+            field_label=(
+                "model.temperature_dependence.dfn.arrhenius_overrides."
+                "positive_exchange_current_ea_j_mol"
+            ),
+        ),
+    )
+    temperature_dependence_config = TemperatureDependenceConfig(
+        dfn=DfnTemperatureDependenceConfig(
+            enabled=bool(dfn_temp_raw.get("enabled", False)),
+            reference_temp_k=dfn_reference_temp_k,
+            arrhenius_overrides=dfn_arrhenius_overrides,
+        )
+    )
+
     try:
         ecm_rc_elements = int(model_raw.get("ecm_rc_elements", 1))
     except (TypeError, ValueError) as exc:
@@ -541,6 +789,7 @@ def load_config(config_path: str | Path) -> Config:
     hppc_points_path = _resolve_optional_path(identification_raw.get("hppc_points_csv"), config_path.parent)
 
     charge_compare_raw = timeseries_raw.get("charge_compare", {})
+    soc_switch_raw = timeseries_raw.get("soc_switch_approx", {})
     rates_raw = charge_compare_raw.get("rates_c", [0.1, 1.0 / 3.0, 1.0])
     rates_c = [float(rate) for rate in rates_raw]
     period_by_rate_raw = charge_compare_raw.get(
@@ -548,6 +797,10 @@ def load_config(config_path: str | Path) -> Config:
         {0.1: 1.0, 1.0 / 3.0: 0.1, 1.0: 0.1},
     )
     period_by_rate_s = {float(rate_key): float(period_value) for rate_key, period_value in period_by_rate_raw.items()}
+    soc_start_raw = soc_switch_raw.get("soc_start")
+    soc_start = None if soc_start_raw is None else float(soc_start_raw)
+    temp_k_raw = soc_switch_raw.get("temp_k")
+    temp_k = None if temp_k_raw is None else float(temp_k_raw)
     benchmark_rates = [float(rate) for rate in benchmark_raw.get("rates_c", [0.2, 1.0])]
     benchmark_profiles = [str(item).strip().lower() for item in benchmark_raw.get(
         "profiles", ["dfn_nmc", "dfn_lfp", "ecm_nmc", "ecm_lfp"]
@@ -587,12 +840,35 @@ def load_config(config_path: str | Path) -> Config:
             )
         )
 
+    termination_config = TerminationConfig(
+        enabled=bool(termination_raw.get("enabled", True)),
+        logic=logic,
+        must_hit=bool(termination_raw.get("must_hit", False)),
+        apply_to_experiment_modes=bool(termination_raw.get("apply_to_experiment_modes", True)),
+        conditions=conditions,
+    )
+    _validate_termination_config(termination_config)
+    soc_switch_config = SocSwitchApproxConfig(
+        enabled=bool(soc_switch_raw.get("enabled", False)),
+        soc_start=soc_start,
+        discharge_rate_c=float(soc_switch_raw.get("discharge_rate_c", 1.0)),
+        discharge_to_soc=float(soc_switch_raw.get("discharge_to_soc", 0.30)),
+        charge_rate_c=float(soc_switch_raw.get("charge_rate_c", 1.0)),
+        charge_to_soc=float(soc_switch_raw.get("charge_to_soc", 0.90)),
+        period_s=float(soc_switch_raw.get("period_s", 0.1)),
+        temp_k=temp_k,
+    )
+    _validate_soc_switch_approx_config(soc_switch_config, float(raw["initial_soc"]))
+    if bool(charge_compare_raw.get("enabled", False)) and soc_switch_config.enabled:
+        raise ValueError("timeseries.charge_compare and timeseries.soc_switch_approx cannot both be enabled.")
+
     return Config(
         model_type=model_type,
         chemistry=chemistry,
         nominal_capacity_ah=float(raw["nominal_capacity_ah"]),
         initial_soc=float(raw["initial_soc"]),
-        ambient_temp_k=float(raw["ambient_temp_k"]),
+        ambient_temp_k=ambient_temp_k,
+        initial_cell_temp_k=initial_cell_temp_k,
         voltage_low_v=float(raw["voltage_low_v"]),
         voltage_high_v=float(raw["voltage_high_v"]),
         discharge_rates_c=[float(rate) for rate in raw["discharge_rates_c"]],
@@ -602,6 +878,13 @@ def load_config(config_path: str | Path) -> Config:
         output_dir=Path(raw["output_dir"]),
         parameter_set=str(raw.get("parameter_set", "Chen2020")),
         thermal=thermal,
+        thermal_coupling=ThermalCouplingConfig(
+            enabled=thermal_coupling_enabled,
+            boundary_mode=thermal_boundary_mode,
+        ),
+        thermal_params=thermal_params,
+        thermal_property_scales=thermal_property_scales,
+        temperature_dependence=temperature_dependence_config,
         ecm_rc_elements=ecm_rc_elements,
         ecm_fitted_pack_json=ecm_fitted_pack_path,
         period_s=int(raw.get("period_s", 30)),
@@ -630,6 +913,7 @@ def load_config(config_path: str | Path) -> Config:
             csv_path=timeseries_csv_path,
             period_s=float(timeseries_raw["period_s"]) if "period_s" in timeseries_raw else None,
             use_temp_as_ambient_boundary=bool(timeseries_raw.get("use_temp_as_ambient_boundary", False)),
+            allow_early_stop=bool(timeseries_raw.get("allow_early_stop", False)),
             charge_compare=ChargeCompareConfig(
                 enabled=bool(charge_compare_raw.get("enabled", False)),
                 soc_start=float(charge_compare_raw.get("soc_start", 0.0)),
@@ -638,6 +922,7 @@ def load_config(config_path: str | Path) -> Config:
                 cv_cutoff_c_rate=float(charge_compare_raw.get("cv_cutoff_c_rate", 0.05)),
                 voltage_high_v=float(charge_compare_raw.get("voltage_high_v", 4.2)),
             ),
+            soc_switch_approx=soc_switch_config,
         ),
         quality_gate=QualityGateConfig(
             enabled=bool(quality_gate_raw.get("enabled", True)),
@@ -664,13 +949,7 @@ def load_config(config_path: str | Path) -> Config:
             period_s=int(benchmark_raw.get("period_s", 30)),
             profiles=benchmark_profiles,
         ),
-        termination=TerminationConfig(
-            enabled=bool(termination_raw.get("enabled", True)),
-            logic=logic,
-            must_hit=bool(termination_raw.get("must_hit", False)),
-            apply_to_experiment_modes=bool(termination_raw.get("apply_to_experiment_modes", True)),
-            conditions=conditions,
-        ),
+        termination=termination_config,
     )
 
 
@@ -706,6 +985,13 @@ def _extract_temperature(solution: pybamm.Solution, config: Config, size: int) -
         return np.full(size, config.ambient_temp_k)
 
 
+def _extract_boundary_temperature(solution: pybamm.Solution, config: Config, size: int) -> np.ndarray:
+    try:
+        return _extract_series(solution, ["Ambient temperature [K]"])
+    except KeyError:
+        return np.full(size, config.ambient_temp_k)
+
+
 def _solution_to_frame(solution: pybamm.Solution, config: Config, initial_soc: float | None = None) -> pd.DataFrame:
     time_s = _extract_series(solution, ["Time [s]"])
     current_a = _extract_series(solution, ["Current [A]"])
@@ -715,7 +1001,8 @@ def _solution_to_frame(solution: pybamm.Solution, config: Config, initial_soc: f
     except KeyError:
         ocv_v = np.full(len(time_s), np.nan)
     soc = _extract_soc(solution, config, initial_soc=initial_soc)
-    temp_k = _extract_temperature(solution, config, len(time_s))
+    cell_temp_k = _extract_temperature(solution, config, len(time_s))
+    boundary_temp_k = _extract_boundary_temperature(solution, config, len(time_s))
     return pd.DataFrame(
         {
             "time_s": time_s,
@@ -723,7 +1010,8 @@ def _solution_to_frame(solution: pybamm.Solution, config: Config, initial_soc: f
             "voltage_v": voltage_v,
             "ocv_v": ocv_v,
             "soc": soc,
-            "temperature_k": temp_k,
+            "cell_temperature_k": cell_temp_k,
+            "boundary_temperature_k": boundary_temp_k,
         }
     )
 
@@ -750,10 +1038,123 @@ def _validate_timeseries_frame(profile: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
+def _validate_soc_switch_approx_config(approx: SocSwitchApproxConfig, initial_soc_default: float) -> float:
+    if not approx.enabled:
+        return float(initial_soc_default)
+    soc_start = float(initial_soc_default if approx.soc_start is None else approx.soc_start)
+    discharge_rate_c = float(approx.discharge_rate_c)
+    charge_rate_c = float(approx.charge_rate_c)
+    discharge_to_soc = float(approx.discharge_to_soc)
+    charge_to_soc = float(approx.charge_to_soc)
+    period_s = float(approx.period_s)
+
+    if not (0.0 <= soc_start <= 1.0):
+        raise ValueError("timeseries.soc_switch_approx.soc_start must be within [0, 1].")
+    if discharge_rate_c <= 0 or charge_rate_c <= 0:
+        raise ValueError("timeseries.soc_switch_approx discharge_rate_c and charge_rate_c must be > 0.")
+    if period_s <= 0:
+        raise ValueError("timeseries.soc_switch_approx.period_s must be > 0.")
+    if not (0.0 <= discharge_to_soc < soc_start):
+        raise ValueError("timeseries.soc_switch_approx.discharge_to_soc must satisfy 0 <= discharge_to_soc < soc_start.")
+    if not (discharge_to_soc < charge_to_soc <= 1.0):
+        raise ValueError(
+            "timeseries.soc_switch_approx.charge_to_soc must satisfy discharge_to_soc < charge_to_soc <= 1."
+        )
+    return soc_start
+
+
+def _build_soc_switch_approx_profile(config: Config) -> tuple[pd.DataFrame, dict[str, float]]:
+    approx = config.timeseries.soc_switch_approx
+    soc_start = _validate_soc_switch_approx_config(approx, config.initial_soc)
+    discharge_rate_c = float(approx.discharge_rate_c)
+    charge_rate_c = float(approx.charge_rate_c)
+    discharge_to_soc = float(approx.discharge_to_soc)
+    charge_to_soc = float(approx.charge_to_soc)
+    period_s = float(approx.period_s)
+    temp_k = float(config.ambient_temp_k if approx.temp_k is None else approx.temp_k)
+
+    discharge_duration_s = (soc_start - discharge_to_soc) / discharge_rate_c * 3600.0
+    charge_duration_s = (charge_to_soc - discharge_to_soc) / charge_rate_c * 3600.0
+    if discharge_duration_s <= 0 or charge_duration_s <= 0:
+        raise ValueError("timeseries.soc_switch_approx produced non-positive segment duration.")
+
+    discharge_current_a = discharge_rate_c * config.nominal_capacity_ah
+    charge_current_a = -charge_rate_c * config.nominal_capacity_ah
+
+    discharge_time = np.arange(0.0, discharge_duration_s + period_s * 0.5, period_s, dtype=float)
+    charge_time_rel = np.arange(period_s, charge_duration_s + period_s * 0.5, period_s, dtype=float)
+    charge_time = discharge_duration_s + charge_time_rel
+    time_s = np.concatenate([discharge_time, charge_time])
+    current_a = np.concatenate(
+        [
+            np.full(discharge_time.shape, discharge_current_a, dtype=float),
+            np.full(charge_time.shape, charge_current_a, dtype=float),
+        ]
+    )
+    temp_series = np.full(time_s.shape, temp_k, dtype=float)
+
+    profile = pd.DataFrame(
+        {
+            "time_s": time_s,
+            "current_a": current_a,
+            "temp_k": temp_series,
+        }
+    )
+    metadata = {
+        "soc_start": float(soc_start),
+        "discharge_to_soc": float(discharge_to_soc),
+        "charge_to_soc": float(charge_to_soc),
+        "discharge_rate_c": float(discharge_rate_c),
+        "charge_rate_c": float(charge_rate_c),
+        "period_s": float(period_s),
+        "temp_k": float(temp_k),
+        "predicted_switch_time_s": float(discharge_duration_s),
+        "predicted_end_time_s": float(discharge_duration_s + charge_duration_s),
+    }
+    return profile, metadata
+
+
+def _wants_timeseries_thermal_boundary(config: Config) -> bool:
+    return bool(
+        config.thermal == "lumped"
+        and config.thermal_coupling.enabled
+        and config.thermal_coupling.boundary_mode == "timeseries"
+    )
+
+
+def _thermal_boundary_fallback_warning(config: Config, mode: str) -> str | None:
+    if not _wants_timeseries_thermal_boundary(config):
+        return None
+    return (
+        f"{mode}: thermal boundary_mode='timeseries' requires an explicit time-temperature sequence; "
+        "falling back to constant ambient_temp_k."
+    )
+
+
+def _has_thermal_param_overrides(config: Config) -> bool:
+    return any(getattr(config.thermal_params, key) is not None for key in _THERMAL_PARAM_TO_PYBAMM_KEY)
+
+
+def _thermal_param_scope_warning(config: Config, mode: str) -> str | None:
+    if not _has_thermal_param_overrides(config):
+        return None
+    if config.model_type == "dfn" and config.thermal == "lumped":
+        return None
+    return (
+        f"{mode}: model.thermal_params is configured but applies only when model.type='dfn' "
+        "and model.thermal='lumped'; keeping bundled thermal parameters for current mode."
+    )
+
+
 def _validate_termination_config(termination: TerminationConfig) -> None:
     if termination.logic != "any_of":
         raise ValueError("termination.logic currently supports only 'any_of'.")
     for index, condition in enumerate(termination.conditions):
+        if condition.metric == "temperature_k":
+            raise ValueError(
+                "termination.conditions[{idx}].metric='temperature_k' is no longer supported. "
+                "Use 'cell_temperature_k' or 'boundary_temperature_k'.".format(idx=index)
+            )
         if condition.metric not in _ALLOWED_TERMINATION_METRICS:
             raise ValueError(
                 f"termination.conditions[{index}].metric must be one of {sorted(_ALLOWED_TERMINATION_METRICS)}"
@@ -940,84 +1341,132 @@ def _build_charge_compare_experiment(rate_c: float, voltage_high_v: float, cv_cu
     return pybamm.Experiment(steps, period=f"{period_s} seconds")
 
 
-def _load_ecm_fitted_pack(path: Path) -> tuple[int, dict[str, np.ndarray]]:
+def _load_ecm_fitted_pack(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"ECM fitted pack not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    order_raw = payload.get("ecm_order")
-    if order_raw is None:
-        model_name = str(payload.get("model", "")).strip().lower()
-        ecm_order = 2 if "2rc" in model_name else 1
-    else:
-        try:
-            ecm_order = int(order_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("ECM fitted pack field 'ecm_order' must be an integer.") from exc
+    schema_version = str(payload.get("schema_version", "")).strip()
+    if schema_version != _ECM_TEMP_PACK_SCHEMA_VERSION:
+        raise ValueError(
+            "Legacy ECM fitted pack format is no longer supported. "
+            f"Expected schema_version='{_ECM_TEMP_PACK_SCHEMA_VERSION}'. "
+            "Please regenerate the fitted pack with the new SOC×temperature pipeline."
+        )
+
+    try:
+        ecm_order = int(payload["ecm_order"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("ECM fitted pack field 'ecm_order' must be an integer.") from exc
     if ecm_order not in _ALLOWED_ECM_RC_ELEMENTS:
         raise ValueError(f"ECM fitted pack field 'ecm_order' must be one of {sorted(_ALLOWED_ECM_RC_ELEMENTS)}.")
 
-    required = {"soc", "ocv_v", "r0_ohm", "r1_ohm", "c1_f"}
+    required_fields = {"soc_axis", "temp_c_axis", "ocv_v", "r0_ohm_map", "r1_ohm_map", "c1_f_map"}
     if ecm_order == 2:
-        required |= {"r2_ohm", "c2_f"}
-    missing = sorted(required - set(payload.keys()))
+        required_fields |= {"r2_ohm_map", "c2_f_map"}
+    missing = sorted(required_fields - set(payload.keys()))
     if missing:
         raise ValueError(f"ECM fitted pack missing fields: {missing}")
 
-    arrays: dict[str, np.ndarray] = {}
-    for key in sorted(required):
-        values = np.asarray(payload[key], dtype=float)
-        if values.ndim != 1 or values.size < 2:
-            raise ValueError(f"ECM fitted pack field '{key}' must be a 1-D array with at least two points.")
+    soc_axis = np.asarray(payload["soc_axis"], dtype=float)
+    temp_c_axis = np.asarray(payload["temp_c_axis"], dtype=float)
+    ocv_v = np.asarray(payload["ocv_v"], dtype=float)
+    if soc_axis.ndim != 1 or soc_axis.size < 2:
+        raise ValueError("ECM fitted pack 'soc_axis' must be a 1-D array with at least two points.")
+    if temp_c_axis.ndim != 1 or temp_c_axis.size < 2:
+        raise ValueError("ECM fitted pack 'temp_c_axis' must be a 1-D array with at least two points.")
+    if ocv_v.ndim != 1 or ocv_v.size != soc_axis.size:
+        raise ValueError("ECM fitted pack 'ocv_v' must be 1-D with same length as 'soc_axis'.")
+    if not np.all(np.isfinite(soc_axis)) or not np.all(np.isfinite(temp_c_axis)) or not np.all(np.isfinite(ocv_v)):
+        raise ValueError("ECM fitted pack axes/ocv contain non-finite values.")
+    if np.any(np.diff(soc_axis) <= 0):
+        raise ValueError("ECM fitted pack 'soc_axis' must be strictly increasing.")
+    if np.any(np.diff(temp_c_axis) <= 0):
+        raise ValueError("ECM fitted pack 'temp_c_axis' must be strictly increasing.")
+    if np.min(soc_axis) < -1e-12 or np.max(soc_axis) > 1.0 + 1e-12:
+        raise ValueError("ECM fitted pack 'soc_axis' must stay within [0, 1].")
+
+    expected_shape = (temp_c_axis.size, soc_axis.size)
+
+    def _map_field(name: str, *, positive: bool) -> np.ndarray:
+        values = np.asarray(payload[name], dtype=float)
+        if values.ndim != 2:
+            raise ValueError(f"ECM fitted pack '{name}' must be a 2-D array with shape [temp, soc].")
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"ECM fitted pack '{name}' shape mismatch: expected {expected_shape}, got {values.shape}."
+            )
         if not np.all(np.isfinite(values)):
-            raise ValueError(f"ECM fitted pack field '{key}' contains non-finite values.")
-        arrays[key] = values
+            raise ValueError(f"ECM fitted pack '{name}' contains non-finite values.")
+        if positive and np.any(values <= 0):
+            raise ValueError(f"ECM fitted pack '{name}' must contain positive values.")
+        return values
 
-    lengths = {name: arr.size for name, arr in arrays.items()}
-    if len(set(lengths.values())) != 1:
-        raise ValueError(f"ECM fitted pack arrays must share the same length, got {lengths}.")
+    maps: dict[str, np.ndarray] = {
+        "r0_ohm_map": _map_field("r0_ohm_map", positive=True),
+        "r1_ohm_map": _map_field("r1_ohm_map", positive=True),
+        "c1_f_map": _map_field("c1_f_map", positive=True),
+    }
+    if ecm_order == 2:
+        maps["r2_ohm_map"] = _map_field("r2_ohm_map", positive=True)
+        maps["c2_f_map"] = _map_field("c2_f_map", positive=True)
 
-    soc = arrays["soc"]
-    if np.any(np.diff(soc) <= 0):
-        raise ValueError("ECM fitted pack 'soc' must be strictly increasing.")
-    if np.min(soc) < -1e-12 or np.max(soc) > 1.0 + 1e-12:
-        raise ValueError("ECM fitted pack 'soc' must stay within [0, 1].")
-    if np.any(arrays["r0_ohm"] <= 0) or np.any(arrays["r1_ohm"] <= 0) or np.any(arrays["c1_f"] <= 0):
-        raise ValueError("ECM fitted pack resistance/capacitance values must be positive.")
-    if ecm_order == 2 and (np.any(arrays["r2_ohm"] <= 0) or np.any(arrays["c2_f"] <= 0)):
-        raise ValueError("ECM fitted pack second RC resistance/capacitance values must be positive.")
-    return ecm_order, arrays
+    return {
+        "ecm_order": ecm_order,
+        "soc_axis": soc_axis,
+        "temp_c_axis": temp_c_axis,
+        "ocv_v": ocv_v,
+        "maps": maps,
+    }
 
 
 def _apply_ecm_fitted_pack(values: pybamm.ParameterValues, pack_path: Path, *, ecm_rc_elements: int) -> None:
-    pack_order, arrays = _load_ecm_fitted_pack(pack_path)
+    pack = _load_ecm_fitted_pack(pack_path)
+    pack_order = int(pack["ecm_order"])
     if pack_order != ecm_rc_elements:
         raise ValueError(
             f"ECM fitted pack order mismatch: pack ecm_order={pack_order}, "
             f"but config model.ecm_rc_elements={ecm_rc_elements}."
         )
-    soc_axis = arrays["soc"]
+
+    soc_axis = np.asarray(pack["soc_axis"], dtype=float)
+    temp_c_axis = np.asarray(pack["temp_c_axis"], dtype=float)
+    ocv_v = np.asarray(pack["ocv_v"], dtype=float)
+    maps: dict[str, np.ndarray] = pack["maps"]
     soc_min = float(soc_axis[0])
     soc_max = float(soc_axis[-1])
+    temp_min = float(temp_c_axis[0])
+    temp_max = float(temp_c_axis[-1])
+
+    def _clamp_soc(target: pybamm.Symbol) -> pybamm.Symbol:
+        return pybamm.maximum(pybamm.Scalar(soc_min), pybamm.minimum(target, pybamm.Scalar(soc_max)))
+
+    def _clamp_temp_c(target: pybamm.Symbol) -> pybamm.Symbol:
+        return pybamm.maximum(pybamm.Scalar(temp_min), pybamm.minimum(target, pybamm.Scalar(temp_max)))
 
     def _soc_interpolant(target: pybamm.Symbol, data: np.ndarray, name: str) -> pybamm.Symbol:
         return pybamm.Interpolant(soc_axis, data, target, name=name)
 
-    def _clamp_soc(target: pybamm.Symbol) -> pybamm.Symbol:
-        # HPPC low-SOC points can briefly drive SOC outside fitted-pack support.
-        # Clamp to pack bounds to avoid unstable extrapolation near 0%/100%.
-        return pybamm.maximum(pybamm.Scalar(soc_min), pybamm.minimum(target, pybamm.Scalar(soc_max)))
+    def _temp_soc_interpolant(
+        temp_c: pybamm.Symbol, soc: pybamm.Symbol, data: np.ndarray, name: str
+    ) -> pybamm.Symbol:
+        return pybamm.Interpolant(
+            (temp_c_axis, soc_axis),
+            data,
+            [_clamp_temp_c(temp_c), _clamp_soc(soc)],
+            name=name,
+        )
 
     def ocv_fn(sto: pybamm.Symbol) -> pybamm.Symbol:
-        return _soc_interpolant(_clamp_soc(sto), arrays["ocv_v"], "ecm_fitted_ocv")
+        return _soc_interpolant(_clamp_soc(sto), ocv_v, "ecm_fitted_ocv")
 
-    def r0_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
-        return _soc_interpolant(_clamp_soc(soc), arrays["r0_ohm"], "ecm_fitted_r0")
+    def r0_fn(t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _temp_soc_interpolant(t_cell, soc, maps["r0_ohm_map"], "ecm_fitted_r0")
 
-    def r1_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
-        return _soc_interpolant(_clamp_soc(soc), arrays["r1_ohm"], "ecm_fitted_r1")
+    def r1_fn(t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _temp_soc_interpolant(t_cell, soc, maps["r1_ohm_map"], "ecm_fitted_r1")
 
-    def c1_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
-        return _soc_interpolant(_clamp_soc(soc), arrays["c1_f"], "ecm_fitted_c1")
+    def c1_fn(t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+        return _temp_soc_interpolant(t_cell, soc, maps["c1_f_map"], "ecm_fitted_c1")
 
     updates: dict[str, Any] = {
         "Open-circuit voltage [V]": ocv_fn,
@@ -1026,11 +1475,12 @@ def _apply_ecm_fitted_pack(values: pybamm.ParameterValues, pack_path: Path, *, e
         "C1 [F]": c1_fn,
     }
     if pack_order == 2:
-        def r2_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
-            return _soc_interpolant(_clamp_soc(soc), arrays["r2_ohm"], "ecm_fitted_r2")
 
-        def c2_fn(_t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
-            return _soc_interpolant(_clamp_soc(soc), arrays["c2_f"], "ecm_fitted_c2")
+        def r2_fn(t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+            return _temp_soc_interpolant(t_cell, soc, maps["r2_ohm_map"], "ecm_fitted_r2")
+
+        def c2_fn(t_cell: pybamm.Symbol, _current: pybamm.Symbol, soc: pybamm.Symbol) -> pybamm.Symbol:
+            return _temp_soc_interpolant(t_cell, soc, maps["c2_f_map"], "ecm_fitted_c2")
 
         updates["R2 [Ohm]"] = r2_fn
         updates["C2 [F]"] = c2_fn
@@ -1038,7 +1488,152 @@ def _apply_ecm_fitted_pack(values: pybamm.ParameterValues, pack_path: Path, *, e
     values.update(updates)
 
 
-def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dict[str, float]]:
+def _arrhenius_multiplier(
+    temperature_k: pybamm.Symbol, *, ea_j_mol: float, reference_temp_k: float
+) -> pybamm.Symbol:
+    return pybamm.exp(
+        (float(ea_j_mol) / pybamm.constants.R)
+        * ((1.0 / float(reference_temp_k)) - (1.0 / temperature_k))
+    )
+
+
+def _wrap_parameter_with_arrhenius_scaling(
+    base_parameter: Any, *, ea_j_mol: float, reference_temp_k: float
+) -> Any:
+    def wrapped(*args: Any) -> Any:
+        base_value = base_parameter(*args) if callable(base_parameter) else base_parameter
+        if len(args) == 0:
+            return base_value
+        temperature_k = args[-1]
+        return base_value * _arrhenius_multiplier(
+            temperature_k,
+            ea_j_mol=float(ea_j_mol),
+            reference_temp_k=float(reference_temp_k),
+        )
+
+    return wrapped
+
+
+def _apply_dfn_arrhenius_overrides(
+    values: pybamm.ParameterValues, config: Config
+) -> list[dict[str, Any]]:
+    if config.model_type != "dfn":
+        return []
+    dfn_temp = config.temperature_dependence.dfn
+    if not dfn_temp.enabled:
+        return []
+
+    updates: dict[str, Any] = {}
+    applied: list[dict[str, Any]] = []
+    for override_field, parameter_key in _DFN_ARRHENIUS_PARAMETER_MAP.items():
+        ea_value = getattr(dfn_temp.arrhenius_overrides, override_field)
+        if ea_value is None:
+            continue
+        if parameter_key not in values.keys():
+            raise ValueError(
+                f"Temperature dependence override requires parameter '{parameter_key}' in parameter set "
+                f"'{config.parameter_set}'."
+            )
+        base_parameter = values[parameter_key]
+        updates[parameter_key] = _wrap_parameter_with_arrhenius_scaling(
+            base_parameter,
+            ea_j_mol=float(ea_value),
+            reference_temp_k=float(dfn_temp.reference_temp_k),
+        )
+        applied.append(
+            {
+                "parameter": parameter_key,
+                "activation_energy_j_mol": float(ea_value),
+                "reference_temp_k": float(dfn_temp.reference_temp_k),
+                "source": f"model.temperature_dependence.dfn.arrhenius_overrides.{override_field}",
+            }
+        )
+
+    if updates:
+        values.update(updates)
+    return applied
+
+
+def _apply_lfp_lumped_thermal_proxy_overrides(
+    values: pybamm.ParameterValues, config: Config
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not (config.model_type == "dfn" and config.chemistry == "lfp" and config.thermal == "lumped"):
+        return {}, []
+    proxy = pybamm.ParameterValues(_LFP_LUMPED_PROXY_SOURCE_SET)
+    updates: dict[str, Any] = {}
+    applied: list[dict[str, Any]] = []
+    for parameter_key in _LFP_LUMPED_PROXY_PARAMETER_KEYS:
+        if parameter_key in values.keys():
+            continue
+        if parameter_key not in proxy.keys():
+            raise ValueError(
+                f"LFP lumped thermal proxy requires parameter '{parameter_key}' in source "
+                f"'{_LFP_LUMPED_PROXY_SOURCE_SET}'."
+            )
+        source_value = proxy[parameter_key]
+        try:
+            target_value: Any = float(source_value)
+        except (TypeError, ValueError):
+            target_value = source_value
+        updates[parameter_key] = target_value
+        applied.append(
+            {
+                "parameter": parameter_key,
+                "base_value": None,
+                "target_value": target_value,
+                "source": f"lfp_lumped_proxy:{_LFP_LUMPED_PROXY_SOURCE_SET}",
+            }
+        )
+    return updates, applied
+
+
+def _apply_thermal_property_scales(
+    values: pybamm.ParameterValues, config: Config
+) -> list[dict[str, Any]]:
+    if not (config.model_type == "dfn" and config.thermal == "lumped"):
+        return []
+    scales = config.thermal_property_scales
+    entries: list[dict[str, Any]] = []
+    updates: dict[str, Any] = {}
+
+    def _scale_many(parameter_keys: tuple[str, ...], *, scale: float, scale_name: str) -> None:
+        if np.isclose(scale, 1.0, atol=1e-12):
+            return
+        for parameter_key in parameter_keys:
+            if parameter_key not in values.keys():
+                continue
+            source_value = values[parameter_key]
+            try:
+                base_value = float(source_value)
+            except (TypeError, ValueError):
+                continue
+            target_value = float(base_value * scale)
+            updates[parameter_key] = target_value
+            entries.append(
+                {
+                    "parameter": parameter_key,
+                    "base_value": base_value,
+                    "target_value": target_value,
+                    "source": f"model.thermal_property_scales.{scale_name}",
+                }
+            )
+
+    _scale_many(
+        _THERMAL_HEAT_CAPACITY_PARAMETER_KEYS,
+        scale=float(scales.heat_capacity_scale),
+        scale_name="heat_capacity_scale",
+    )
+    _scale_many(
+        _THERMAL_CONDUCTIVITY_PARAMETER_KEYS,
+        scale=float(scales.thermal_conductivity_scale),
+        scale_name="thermal_conductivity_scale",
+    )
+    if updates:
+        values.update(updates)
+    return entries
+
+
+def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dict[str, Any]]:
     values = pybamm.ParameterValues(config.parameter_set)
     capacity_key = None
     for key in ["Nominal cell capacity [A.h]", "Cell capacity [A.h]"]:
@@ -1068,10 +1663,39 @@ def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dic
     if "Ambient temperature [K]" in values.keys():
         updates["Ambient temperature [K]"] = config.ambient_temp_k
     if "Initial temperature [K]" in values.keys():
-        updates["Initial temperature [K]"] = config.ambient_temp_k
+        updates["Initial temperature [K]"] = config.initial_cell_temp_k
     if "Initial SoC" in values.keys():
         updates["Initial SoC"] = _effective_initial_soc(config, config.initial_soc)
+    thermal_overrides_requested = _has_thermal_param_overrides(config)
+    thermal_overrides_applied = bool(config.model_type == "dfn" and config.thermal == "lumped")
+    thermal_overrides: list[dict[str, Any]] = []
+    if thermal_overrides_requested and thermal_overrides_applied:
+        for config_key, parameter_key in _THERMAL_PARAM_TO_PYBAMM_KEY.items():
+            target_value = getattr(config.thermal_params, config_key)
+            if target_value is None:
+                continue
+            base_value: Any = None
+            if parameter_key in values.keys():
+                source = values[parameter_key]
+                try:
+                    base_value = float(source)
+                except (TypeError, ValueError):
+                    base_value = source
+            updates[parameter_key] = float(target_value)
+            thermal_overrides.append(
+                {
+                    "config_key": config_key,
+                    "parameter": parameter_key,
+                    "base_value": base_value,
+                    "target_value": float(target_value),
+                    "source": "model.thermal_params",
+                }
+            )
+    lfp_lumped_proxy_updates, lfp_lumped_proxy_overrides = _apply_lfp_lumped_thermal_proxy_overrides(values, config)
+    updates.update(lfp_lumped_proxy_updates)
     values.update(updates)
+    thermal_property_scale_overrides = _apply_thermal_property_scales(values, config)
+    dfn_arrhenius_applied = _apply_dfn_arrhenius_overrides(values, config)
     if config.model_type == "ecm" and config.ecm_fitted_pack_json is not None:
         _apply_ecm_fitted_pack(values, config.ecm_fitted_pack_json, ecm_rc_elements=config.ecm_rc_elements)
     scaling = {
@@ -1084,11 +1708,25 @@ def _build_parameter_values(config: Config) -> tuple[pybamm.ParameterValues, dic
         "parallel_parameter_present": float(has_parallel),
         "parallel_before": base_parallel,
         "parallel_after": parallel_after,
+        "thermal_overrides_requested": thermal_overrides_requested,
+        "thermal_overrides_applied": thermal_overrides_applied and bool(
+            thermal_overrides or lfp_lumped_proxy_overrides or thermal_property_scale_overrides
+        ),
+        "thermal_overrides": thermal_overrides,
+        "lfp_lumped_thermal_proxy_overrides": lfp_lumped_proxy_overrides,
+        "thermal_property_scale_overrides": thermal_property_scale_overrides,
+        "thermal_property_scales": {
+            "heat_capacity_scale": float(config.thermal_property_scales.heat_capacity_scale),
+            "thermal_conductivity_scale": float(config.thermal_property_scales.thermal_conductivity_scale),
+        },
+        "dfn_temperature_dependence_enabled": bool(config.temperature_dependence.dfn.enabled),
+        "dfn_temperature_reference_temp_k": float(config.temperature_dependence.dfn.reference_temp_k),
+        "dfn_arrhenius_overrides_applied": dfn_arrhenius_applied,
     }
     return values, scaling
 
 
-def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, float]) -> Path:
+def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, Any]) -> Path:
     audit_path = output_dir / "parameter_audit.json"
     quality_level = _resolve_parameter_quality_level(config)
     scaled_entries = [
@@ -1140,6 +1778,10 @@ def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, 
         if quality_level == "proxy"
         else "Identified ECM fitted pack in use; results are calibrated against DFN reference curves."
     )
+    thermal_override_entries = list(scaling.get("thermal_overrides", []))
+    thermal_proxy_entries = list(scaling.get("lfp_lumped_thermal_proxy_overrides", []))
+    thermal_scale_entries = list(scaling.get("thermal_property_scale_overrides", []))
+    dfn_arrhenius_entries = list(scaling.get("dfn_arrhenius_overrides_applied", []))
     audit = {
         "base_parameter_set": config.parameter_set,
         "parameter_pack": {
@@ -1156,6 +1798,14 @@ def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, 
         },
         "scaling": scaling,
         "scaled": scaled_entries,
+        "thermal_overrides": thermal_override_entries,
+        "thermal_proxy_overrides": thermal_proxy_entries,
+        "thermal_scale_overrides": thermal_scale_entries,
+        "temperature_dependence": {
+            "dfn_enabled": bool(config.temperature_dependence.dfn.enabled),
+            "dfn_reference_temp_k": float(config.temperature_dependence.dfn.reference_temp_k),
+            "dfn_arrhenius_overrides_applied": dfn_arrhenius_entries,
+        },
         "reused": reused,
         "pending_identification": pending_identification,
         "disclaimer": disclaimer,
@@ -1165,9 +1815,17 @@ def _write_parameter_audit(config: Config, output_dir: Path, scaling: dict[str, 
 
 
 def _write_empty_timeseries(csv_path: Path) -> None:
-    pd.DataFrame(columns=["time_s", "current_a", "voltage_v", "ocv_v", "soc", "temperature_k"]).to_csv(
-        csv_path, index=False
-    )
+    pd.DataFrame(
+        columns=[
+            "time_s",
+            "current_a",
+            "voltage_v",
+            "ocv_v",
+            "soc",
+            "cell_temperature_k",
+            "boundary_temperature_k",
+        ]
+    ).to_csv(csv_path, index=False)
 
 
 def _strictly_monotonic(values: np.ndarray) -> bool:
@@ -1355,17 +2013,32 @@ def simulate_from_timeseries(
     effective_initial_soc = _effective_initial_soc(config, initial_soc)
     use_initial_soc = _uses_initial_soc_argument(config)
     parameter_values = _set_initial_soc_if_supported(base_values, effective_initial_soc)
+    pre_warnings: list[str] = []
+    boundary_from_timeseries = False
     updates: dict[str, Any] = {
         "Current function [A]": pybamm.Interpolant(times, currents, pybamm.t),
     }
-    # Replay mode should follow the provided current profile without stopping at built-in cutoffs.
-    if "Lower voltage cut-off [V]" in parameter_values.keys():
-        updates["Lower voltage cut-off [V]"] = 0.0
-    if "Upper voltage cut-off [V]" in parameter_values.keys():
-        updates["Upper voltage cut-off [V]"] = 6.0
-    if config.model_type == "dfn":
-        if config.thermal == "lumped" and config.timeseries.use_temp_as_ambient_boundary:
+    disable_built_in_cutoffs = True
+    if config.model_type == "dfn" and config.chemistry == "lfp" and config.thermal == "lumped":
+        disable_built_in_cutoffs = False
+        pre_warnings.append(
+            "Keeping built-in voltage cutoffs for LFP DFN lumped replay to avoid non-physical divergence."
+        )
+    if disable_built_in_cutoffs:
+        # Replay mode should follow the provided current profile without stopping at built-in cutoffs.
+        if "Lower voltage cut-off [V]" in parameter_values.keys():
+            updates["Lower voltage cut-off [V]"] = 0.0
+        if "Upper voltage cut-off [V]" in parameter_values.keys():
+            updates["Upper voltage cut-off [V]"] = 6.0
+    if _wants_timeseries_thermal_boundary(config):
+        if "Ambient temperature [K]" in parameter_values.keys():
             updates["Ambient temperature [K]"] = pybamm.Interpolant(times, input_temps, pybamm.t)
+            boundary_from_timeseries = True
+        else:
+            pre_warnings.append(
+                "Timeseries: thermal boundary_mode='timeseries' requested but parameter set has no "
+                "'Ambient temperature [K]'; using constant ambient_temp_k."
+            )
     parameter_values.update(updates)
     def _solve_with_solver(solver_obj: pybamm.BaseSolver) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
         sim = pybamm.Simulation(
@@ -1377,13 +2050,36 @@ def simulate_from_timeseries(
             sim, effective_initial_soc, t_eval=times, use_initial_soc=use_initial_soc
         )
 
-    solution, runtime, warnings, error = _solve_with_solver(idaklu_solver)
-    tried_casadi = False
+    prefer_casadi_primary = _prefer_casadi_primary_solver(config)
+    if prefer_casadi_primary:
+        primary_solver: pybamm.BaseSolver = pybamm.CasadiSolver(
+            mode="safe",
+            rtol=config.solver_rtol,
+            atol=config.solver_atol,
+        )
+    else:
+        primary_solver = idaklu_solver
 
-    def _retry_with_casadi(reason: str) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
+    solution, runtime, warnings, error = _solve_with_solver(primary_solver)
+    if prefer_casadi_primary:
+        warnings = _dedupe_messages(
+            pre_warnings
+            + ["Using CasadiSolver(mode='safe') as primary solver for LFP DFN lumped thermal replay."]
+            + warnings
+        )
+    else:
+        warnings = _dedupe_messages(pre_warnings + warnings)
+    tried_casadi = prefer_casadi_primary
+
+    def _retry_with_casadi(
+        reason: str,
+        *,
+        rtol: float,
+        atol: float,
+    ) -> tuple[pybamm.Solution | None, float, list[str], str | None]:
         nonlocal tried_casadi
         tried_casadi = True
-        fallback_solver = pybamm.CasadiSolver(mode="safe", rtol=config.solver_rtol, atol=config.solver_atol)
+        fallback_solver = pybamm.CasadiSolver(mode="safe", rtol=rtol, atol=atol)
         fb_solution, fb_runtime, fb_warnings, fb_error = _solve_with_solver(fallback_solver)
         merged_warnings = _dedupe_messages(
             warnings
@@ -1393,15 +2089,40 @@ def simulate_from_timeseries(
         return fb_solution, fb_runtime, merged_warnings, fb_error
 
     total_runtime = runtime
-    if (solution is None or isinstance(solution, pybamm.EmptySolution)) and _should_retry_with_casadi(config, error):
+    if (
+        not prefer_casadi_primary
+        and (solution is None or isinstance(solution, pybamm.EmptySolution))
+        and _should_retry_with_casadi(config, error)
+    ):
         solution, fb_runtime, warnings, fb_error = _retry_with_casadi(
-            "IDAKLU solver failed with stiff error signature; retrying with CasadiSolver(mode='safe')."
+            "IDAKLU solver failed with stiff error signature; retrying with CasadiSolver(mode='safe').",
+            rtol=config.solver_rtol,
+            atol=config.solver_atol,
         )
         total_runtime += fb_runtime
         if solution is not None and not isinstance(solution, pybamm.EmptySolution):
             error = fb_error
         else:
             error = fb_error or error
+        if (
+            (solution is None or isinstance(solution, pybamm.EmptySolution))
+            and _should_retry_with_casadi(config, error)
+        ):
+            relaxed_rtol = max(config.solver_rtol * 20.0, 1e-5)
+            relaxed_atol = max(config.solver_atol * 20.0, 1e-7)
+            solution, fb_runtime_relaxed, warnings, fb_error_relaxed = _retry_with_casadi(
+                (
+                    "CasadiSolver(mode='safe') fallback failed with strict tolerances; "
+                    "retrying once with relaxed tolerances."
+                ),
+                rtol=relaxed_rtol,
+                atol=relaxed_atol,
+            )
+            total_runtime += fb_runtime_relaxed
+            if solution is not None and not isinstance(solution, pybamm.EmptySolution):
+                error = fb_error_relaxed
+            else:
+                error = fb_error_relaxed or error
 
     runtime = total_runtime
     if solution is None or isinstance(solution, pybamm.EmptySolution):
@@ -1417,6 +2138,9 @@ def simulate_from_timeseries(
                 "IDAKLU solver terminated early in replay mode; "
                 "retrying with CasadiSolver(mode='safe')."
             )
+            ,
+            rtol=config.solver_rtol,
+            atol=config.solver_atol,
         )
         total_runtime += fb_runtime
         runtime = total_runtime
@@ -1428,27 +2152,67 @@ def simulate_from_timeseries(
         if dense_time.size == 0:
             return None, runtime, warnings, "Timeseries simulation produced no time points."
 
+    output_times = times
+    output_currents = currents
+    output_input_temps = input_temps
     if dense_time[-1] < times[-1] - 1e-9:
-        return (
-            None,
-            runtime,
-            warnings,
-            f"Timeseries simulation terminated early ({dense_time[-1]:.3f}s < {times[-1]:.3f}s).",
-        )
+        if config.timeseries.allow_early_stop:
+            keep_mask = times <= dense_time[-1] + 1e-9
+            if not np.any(keep_mask):
+                return (
+                    None,
+                    runtime,
+                    warnings,
+                    "Timeseries simulation terminated before first sample point.",
+                )
+            output_times = times[keep_mask]
+            output_currents = currents[keep_mask]
+            output_input_temps = input_temps[keep_mask]
+            warnings = _dedupe_messages(
+                warnings
+                + [
+                    (
+                        "Timeseries simulation terminated early "
+                        f"({dense_time[-1]:.3f}s < {times[-1]:.3f}s); "
+                        "truncated output because timeseries.allow_early_stop=true."
+                    )
+                ]
+            )
+        else:
+            return (
+                None,
+                runtime,
+                warnings,
+                f"Timeseries simulation terminated early ({dense_time[-1]:.3f}s < {times[-1]:.3f}s).",
+            )
+
+    dense_cell_temperature = dense["cell_temperature_k"].to_numpy(dtype=float)
+    if "boundary_temperature_k" in dense.columns:
+        dense_boundary_temperature = dense["boundary_temperature_k"].to_numpy(dtype=float)
+    else:
+        dense_boundary_temperature = np.full(dense_time.shape, config.ambient_temp_k, dtype=float)
 
     if config.thermal == "lumped":
-        temperature_out = np.interp(times, dense_time, dense["temperature_k"].to_numpy(dtype=float))
+        cell_temperature_out = np.interp(output_times, dense_time, dense_cell_temperature)
     else:
-        temperature_out = input_temps
+        cell_temperature_out = output_input_temps
+
+    if _wants_timeseries_thermal_boundary(config) and boundary_from_timeseries:
+        boundary_temperature_out = output_input_temps
+    elif config.thermal == "lumped":
+        boundary_temperature_out = np.interp(output_times, dense_time, dense_boundary_temperature)
+    else:
+        boundary_temperature_out = output_input_temps
 
     frame = pd.DataFrame(
         {
-            "time_s": times,
-            "current_a": currents,
-            "voltage_v": np.interp(times, dense_time, dense["voltage_v"].to_numpy(dtype=float)),
-            "ocv_v": np.interp(times, dense_time, dense["ocv_v"].to_numpy(dtype=float)),
-            "soc": np.interp(times, dense_time, dense["soc"].to_numpy(dtype=float)),
-            "temperature_k": temperature_out,
+            "time_s": output_times,
+            "current_a": output_currents,
+            "voltage_v": np.interp(output_times, dense_time, dense["voltage_v"].to_numpy(dtype=float)),
+            "ocv_v": np.interp(output_times, dense_time, dense["ocv_v"].to_numpy(dtype=float)),
+            "soc": np.interp(output_times, dense_time, dense["soc"].to_numpy(dtype=float)),
+            "cell_temperature_k": cell_temperature_out,
+            "boundary_temperature_k": boundary_temperature_out,
         }
     )
     return frame, runtime, warnings, error
@@ -1487,6 +2251,9 @@ def _run_sanity_gate(config: Config, base_values: pybamm.ParameterValues, output
     solution, runtime, warnings, error = _solve_with_warning_capture(
         sim, initial_soc, use_initial_soc=_uses_initial_soc_argument(config)
     )
+    boundary_warning = _thermal_boundary_fallback_warning(config, mode="sanity_gate")
+    if boundary_warning:
+        warnings = _dedupe_messages([boundary_warning] + warnings)
     has_pos = False
     has_neg = False
     if solution is None or isinstance(solution, pybamm.EmptySolution):
@@ -1888,6 +2655,9 @@ def run_benchmark_pipeline(config: Config) -> dict[str, Any]:
 
     matrix_rows: list[dict[str, Any]] = []
     warnings: list[str] = []
+    thermal_param_warning = _thermal_param_scope_warning(config, mode="benchmark")
+    if thermal_param_warning:
+        warnings.append(thermal_param_warning)
     if not config.benchmark.enabled:
         matrix_path = output_dir / "benchmark_matrix.csv"
         pd.DataFrame(matrix_rows).to_csv(matrix_path, index=False)
@@ -1929,6 +2699,9 @@ def run_benchmark_pipeline(config: Config) -> dict[str, Any]:
             matrix_rows=matrix_rows,
         )
         config_dict = _config_to_summary_dict(config)
+        disabled_warnings = ["Benchmark disabled by configuration."]
+        if thermal_param_warning:
+            disabled_warnings.append(thermal_param_warning)
         summary = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "mode": "benchmark",
@@ -1940,7 +2713,7 @@ def run_benchmark_pipeline(config: Config) -> dict[str, Any]:
             "quality_gate": quality_gate_payload,
             "benchmark": benchmark_payload,
             "cases": [],
-            "warnings": ["Benchmark disabled by configuration."],
+            "warnings": _dedupe_messages(disabled_warnings),
         }
         _merge_identification_validation(summary, ident_validation, context="benchmark")
         _write_summary_json(output_dir, summary)
@@ -2292,8 +3065,14 @@ def run_baseline_pipeline(config: Config) -> dict[str, Any]:
         "sanity_gate": asdict(gate),
         "cases": [],
     }
+    boundary_warning = _thermal_boundary_fallback_warning(config, mode="baseline")
+    thermal_param_warning = _thermal_param_scope_warning(config, mode="baseline")
     if not gate.passed:
         warnings = list(gate.warning_messages)
+        if boundary_warning:
+            warnings.append(boundary_warning)
+        if thermal_param_warning:
+            warnings.append(thermal_param_warning)
         warnings.append("Sanity gate failed; batch simulations were blocked.")
         if gate.error:
             warnings.append(f"Sanity gate error: {gate.error}")
@@ -2314,6 +3093,10 @@ def run_baseline_pipeline(config: Config) -> dict[str, Any]:
     summary["cases"] = [asdict(case) for case in cases]
 
     warnings: list[str] = []
+    if boundary_warning:
+        warnings.append(boundary_warning)
+    if thermal_param_warning:
+        warnings.append(thermal_param_warning)
     if overlay_warning:
         warnings.append(overlay_warning)
     for case in cases:
@@ -2629,6 +3412,12 @@ def run_hppc_pipeline(config: Config) -> dict[str, Any]:
         "cases": [],
     }
     warnings: list[str] = []
+    boundary_warning = _thermal_boundary_fallback_warning(config, mode="hppc")
+    thermal_param_warning = _thermal_param_scope_warning(config, mode="hppc")
+    if boundary_warning:
+        warnings.append(boundary_warning)
+    if thermal_param_warning:
+        warnings.append(thermal_param_warning)
     if overlay_warning:
         warnings.append(overlay_warning)
     for point in points:
@@ -2654,6 +3443,12 @@ def run_charge_compare_pipeline(config: Config) -> dict[str, Any]:
 
     charge_cfg = config.timeseries.charge_compare
     warnings: list[str] = []
+    boundary_warning = _thermal_boundary_fallback_warning(config, mode="timeseries|charge_compare")
+    thermal_param_warning = _thermal_param_scope_warning(config, mode="timeseries|charge_compare")
+    if boundary_warning:
+        warnings.append(boundary_warning)
+    if thermal_param_warning:
+        warnings.append(thermal_param_warning)
     stop_reason: str | None = None
     cases: list[ChargeCompareCaseResult] = []
 
@@ -2785,24 +3580,47 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
     output_json = output_dir / "timeseries_summary.json"
     stop_reason: str | None = None
     warnings: list[str] = []
+    thermal_param_warning = _thermal_param_scope_warning(config, mode="timeseries")
+    if thermal_param_warning:
+        warnings.append(thermal_param_warning)
     case: RunSummary | None = None
     source_csv: str | None = None
+    frame_result: pd.DataFrame | None = None
+    soc_switch_payload: dict[str, Any] | None = None
+    generated_profile_csv: Path | None = None
 
     if not config.timeseries.enabled:
         stop_reason = "Timeseries mode disabled by configuration."
         _write_empty_timeseries(output_csv)
-    elif config.timeseries.csv_path is None:
+    elif (not config.timeseries.soc_switch_approx.enabled) and config.timeseries.csv_path is None:
         stop_reason = "timeseries.csv_path is required when mode=timeseries."
         _write_empty_timeseries(output_csv)
     else:
-        source_csv = str(config.timeseries.csv_path)
         try:
-            profile = _load_timeseries_csv(config.timeseries.csv_path)
+            initial_soc_for_run = config.initial_soc
+            if config.timeseries.soc_switch_approx.enabled:
+                profile, switch_meta = _build_soc_switch_approx_profile(config)
+                initial_soc_for_run = float(switch_meta["soc_start"])
+                source_csv = "generated:soc_switch_approx"
+                generated_profile_csv = output_dir / "soc_switch_approx_input.csv"
+                profile.to_csv(generated_profile_csv, index=False)
+                soc_switch_payload = {
+                    "enabled": True,
+                    "source": "generated_timeseries",
+                    **switch_meta,
+                    "soc_at_predicted_switch": None,
+                    "switch_soc_error": None,
+                    "final_soc": None,
+                    "final_soc_error": None,
+                }
+            else:
+                source_csv = str(config.timeseries.csv_path)
+                profile = _load_timeseries_csv(config.timeseries.csv_path)
             frame, runtime, sim_warnings, sim_error = simulate_from_timeseries(
                 config=config,
                 base_values=base_values,
                 profile=profile,
-                initial_soc=config.initial_soc,
+                initial_soc=initial_soc_for_run,
             )
             warnings.extend(sim_warnings)
             if frame is None:
@@ -2824,6 +3642,7 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
                     frame, config, context_mode="timeseries"
                 )
                 frame.to_csv(output_csv, index=False)
+                frame_result = frame
                 case_error = sim_error or termination_error
                 case = RunSummary(
                     case_id="timeseries_case",
@@ -2853,6 +3672,20 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
                 error=stop_reason,
             )
 
+    if soc_switch_payload is not None and frame_result is not None and not frame_result.empty:
+        switch_time = float(soc_switch_payload["predicted_switch_time_s"])
+        target_discharge_soc = float(soc_switch_payload["discharge_to_soc"])
+        target_charge_soc = float(soc_switch_payload["charge_to_soc"])
+        time_values = frame_result["time_s"].to_numpy(dtype=float)
+        soc_values = frame_result["soc"].to_numpy(dtype=float)
+        if switch_time <= float(time_values[-1]) + 1e-9:
+            soc_at_switch = float(np.interp(switch_time, time_values, soc_values))
+            soc_switch_payload["soc_at_predicted_switch"] = soc_at_switch
+            soc_switch_payload["switch_soc_error"] = soc_at_switch - target_discharge_soc
+        final_soc_val = float(soc_values[-1])
+        soc_switch_payload["final_soc"] = final_soc_val
+        soc_switch_payload["final_soc_error"] = final_soc_val - target_charge_soc
+
     passed = bool(case and case.converged and stop_reason is None)
     payload = {
         "enabled": config.timeseries.enabled,
@@ -2867,6 +3700,10 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
         },
         "case": asdict(case) if case else None,
     }
+    if generated_profile_csv is not None:
+        payload["artifacts"]["soc_switch_approx_input_csv"] = str(generated_profile_csv)
+    if soc_switch_payload is not None:
+        payload["soc_switch_approx"] = soc_switch_payload
     output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     config_dict = _config_to_summary_dict(config)
@@ -2886,6 +3723,8 @@ def run_timeseries_pipeline(config: Config) -> dict[str, Any]:
         "timeseries": payload,
         "cases": [asdict(case)] if case else [],
     }
+    if generated_profile_csv is not None:
+        summary["artifacts"]["soc_switch_approx_input_csv"] = str(generated_profile_csv)
     if warnings:
         summary["warnings"] = _dedupe_messages(warnings)
     if stop_reason and config.timeseries.enabled:

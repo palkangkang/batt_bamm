@@ -10,7 +10,7 @@ import pandas as pd
 import yaml
 
 from batt_bamm.hppc_compare import run_compare_pipeline
-from batt_bamm.main import _soc_grid, run_from_config
+from batt_bamm.main import _soc_grid, load_config, run_from_config
 
 
 def _discharge_segment(frame: pd.DataFrame) -> pd.DataFrame:
@@ -145,6 +145,105 @@ class TestBaselinePipeline(unittest.TestCase):
         self.assertTrue(np.isclose(ratio, nominal_ratio, atol=1e-12))
         self.assertTrue(np.isclose(parallel_ratio, nominal_ratio, atol=1e-12))
         self.assertIn(parameter_pack["quality_level"], {"proxy", "identified"})
+        self.assertEqual(audit.get("thermal_overrides"), [])
+
+    def test_thermal_params_override_applies_and_audits(self) -> None:
+        output_dir = self._root / "thermal_params_override_baseline"
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(output_dir)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_params"] = {
+            "total_heat_transfer_coefficient_w_m2_k": 120.0,
+            "cell_volume_m3": 0.000726,
+            "cell_cooling_surface_area_m2": 0.0512674863,
+        }
+        cfg["sanity_gate"]["enabled"] = False
+        cfg["discharge_rates_c"] = [0.2]
+        cfg["period_s"] = 300
+        cfg_path = self._root / "thermal_params_override_baseline.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="baseline")
+        self.assertTrue(summary["all_converged"])
+        audit = json.loads((output_dir / "parameter_audit.json").read_text(encoding="utf-8"))
+        overrides = audit.get("thermal_overrides", [])
+        self.assertEqual(len(overrides), 3)
+        expected = {
+            "Total heat transfer coefficient [W.m-2.K-1]": 120.0,
+            "Cell volume [m3]": 0.000726,
+            "Cell cooling surface area [m2]": 0.0512674863,
+        }
+        observed = {item["parameter"]: float(item["target_value"]) for item in overrides}
+        self.assertEqual(set(observed), set(expected))
+        for key, value in expected.items():
+            self.assertTrue(np.isclose(observed[key], value, atol=1e-12), msg=f"Mismatch for {key}")
+        self.assertTrue(audit["scaling"]["thermal_overrides_requested"])
+        self.assertTrue(audit["scaling"]["thermal_overrides_applied"])
+
+    def test_thermal_params_invalid_value_fail_fast(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "thermal_params_invalid")
+        cfg["model"]["thermal_params"] = {
+            "cell_volume_m3": 0.0,
+        }
+        cfg_path = self._root / "thermal_params_invalid.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            run_from_config(cfg_path, mode="baseline")
+        self.assertIn("model.thermal_params.cell_volume_m3", str(ctx.exception))
+
+    def test_dfn_arrhenius_overrides_applied_and_audited(self) -> None:
+        output_dir = self._root / "arrhenius_override_baseline"
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(output_dir)
+        cfg["discharge_rates_c"] = [0.2]
+        cfg["sanity_gate"]["enabled"] = False
+        cfg["period_s"] = 300
+        cfg["model"]["temperature_dependence"] = {
+            "dfn": {
+                "enabled": True,
+                "reference_temp_k": 298.15,
+                "arrhenius_overrides": {
+                    "negative_exchange_current_ea_j_mol": 25000.0,
+                    "positive_exchange_current_ea_j_mol": 28000.0,
+                },
+            }
+        }
+        cfg_path = self._root / "arrhenius_override_baseline.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="baseline")
+        self.assertTrue(summary["all_converged"])
+        audit = json.loads((output_dir / "parameter_audit.json").read_text(encoding="utf-8"))
+        temp_dep = audit.get("temperature_dependence", {})
+        self.assertTrue(temp_dep.get("dfn_enabled"))
+        self.assertTrue(np.isclose(float(temp_dep.get("dfn_reference_temp_k")), 298.15, atol=1e-12))
+        applied = temp_dep.get("dfn_arrhenius_overrides_applied", [])
+        self.assertEqual(len(applied), 2)
+        keys = {entry.get("parameter") for entry in applied}
+        self.assertIn("Negative electrode exchange-current density [A.m-2]", keys)
+        self.assertIn("Positive electrode exchange-current density [A.m-2]", keys)
+
+    def test_dfn_arrhenius_override_invalid_value_fail_fast(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "arrhenius_invalid")
+        cfg["model"]["temperature_dependence"] = {
+            "dfn": {
+                "enabled": True,
+                "arrhenius_overrides": {
+                    "negative_particle_diffusivity_ea_j_mol": -1.0,
+                },
+            }
+        }
+        cfg_path = self._root / "arrhenius_invalid.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            run_from_config(cfg_path, mode="baseline")
+        self.assertIn(
+            "model.temperature_dependence.dfn.arrhenius_overrides.negative_particle_diffusivity_ea_j_mol",
+            str(ctx.exception),
+        )
 
     def test_physical_sanity(self) -> None:
         for case in self._batch_summary["cases"]:
@@ -212,7 +311,7 @@ class TestBaselinePipeline(unittest.TestCase):
         summary_path = self._batch_output / "summary.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         self.assertIn("contract_version", summary)
-        self.assertEqual(summary["contract_version"], "1.1.0")
+        self.assertEqual(summary["contract_version"], "3.0.0")
         self.assertIn("contract_fields", summary)
         self.assertIn("stable_top_level_fields", summary["contract_fields"])
         self.assertIn("generated_at_utc", summary)
@@ -278,6 +377,22 @@ class TestBaselinePipeline(unittest.TestCase):
         frame = pd.read_csv(case["csv_path"])
         self.assertGreater(float(frame["time_s"].iloc[-1]), 10.0)
 
+    def test_baseline_lumped_timeseries_boundary_falls_back_with_warning(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "baseline_lumped_boundary_fallback"
+        cfg["output_dir"] = str(output_dir)
+        cfg["discharge_rates_c"] = [0.2]
+        cfg["sanity_gate"]["enabled"] = False
+        cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_coupling"] = {"enabled": True, "boundary_mode": "timeseries"}
+        cfg_path = self._root / "baseline_lumped_boundary_fallback.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="baseline")
+        self.assertTrue(summary["all_converged"])
+        warnings = [str(item) for item in summary.get("warnings", [])]
+        self.assertTrue(any("falling back to constant ambient_temp_k" in item for item in warnings))
+
 
 class TestHppcPipeline(unittest.TestCase):
     @classmethod
@@ -336,7 +451,7 @@ class TestHppcPipeline(unittest.TestCase):
     def test_hppc_contract(self) -> None:
         self.assertTrue(self._summary["all_converged"])
         self.assertEqual(self._summary["mode"], "hppc")
-        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertEqual(self._summary["contract_version"], "3.0.0")
         self.assertIn("contract_fields", self._summary)
         hppc = self._summary["hppc"]
         expected = {
@@ -579,7 +694,7 @@ class TestTimeseriesPipeline(unittest.TestCase):
     def test_timeseries_contract(self) -> None:
         self.assertTrue(self._summary["all_converged"])
         self.assertEqual(self._summary["mode"], "timeseries")
-        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertEqual(self._summary["contract_version"], "3.0.0")
         self.assertIn("contract_fields", self._summary)
         payload = self._summary["timeseries"]
         expected = {
@@ -601,10 +716,14 @@ class TestTimeseriesPipeline(unittest.TestCase):
     def test_timeseries_physical_sanity(self) -> None:
         frame = pd.read_csv(self._output / "timeseries_output.csv")
         self.assertIn("ocv_v", frame.columns)
+        self.assertIn("cell_temperature_k", frame.columns)
+        self.assertIn("boundary_temperature_k", frame.columns)
         self.assertTrue((frame["voltage_v"] > 0).all())
         self.assertTrue((frame["voltage_v"] < 5).all())
         self.assertLessEqual(frame["soc"].iloc[-1], frame["soc"].iloc[0] + 1e-6)
-        self.assertTrue(np.allclose(frame["temperature_k"].to_numpy(), 298.15))
+        self.assertTrue(np.allclose(frame["cell_temperature_k"].to_numpy(), 298.15))
+        self.assertTrue(np.allclose(frame["boundary_temperature_k"].to_numpy(), 298.15))
+        self.assertNotIn("temperature_k", frame.columns)
 
     def test_timeseries_lumped_shows_temperature_rise(self) -> None:
         hot_csv = self._root / "input_timeseries_hot.csv"
@@ -621,8 +740,10 @@ class TestTimeseriesPipeline(unittest.TestCase):
         summary = run_from_config(cfg_path, mode="timeseries")
         self.assertTrue(summary["all_converged"])
         frame = pd.read_csv(output_dir / "timeseries_output.csv")
-        temp = frame["temperature_k"].to_numpy(dtype=float)
-        self.assertGreater(float(np.max(temp) - np.min(temp)), 1e-6)
+        cell_temp = frame["cell_temperature_k"].to_numpy(dtype=float)
+        boundary_temp = frame["boundary_temperature_k"].to_numpy(dtype=float)
+        self.assertGreater(float(np.max(cell_temp) - np.min(cell_temp)), 1e-6)
+        self.assertTrue(np.allclose(boundary_temp, 298.15))
 
     def test_timeseries_repeatability(self) -> None:
         output_a = self._root / "repeat_a"
@@ -635,6 +756,91 @@ class TestTimeseriesPipeline(unittest.TestCase):
         self.assertTrue(case_b["converged"])
         for key in ("min_v", "max_v", "final_soc"):
             self.assertTrue(np.isclose(case_a[key], case_b[key], atol=5e-4), msg=f"Mismatch at {key}")
+
+    def test_timeseries_soc_switch_approx_cycle(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "soc_switch_approx_outputs"
+        cfg["output_dir"] = str(output_dir)
+        cfg["initial_soc"] = 0.80
+        cfg["ambient_temp_k"] = 298.15
+        cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_coupling"] = {"enabled": True, "boundary_mode": "constant"}
+        cfg["timeseries"]["csv_path"] = ""
+        cfg["timeseries"]["charge_compare"] = {"enabled": False}
+        cfg["timeseries"]["soc_switch_approx"] = {
+            "enabled": True,
+            "soc_start": 0.80,
+            "discharge_rate_c": 1.0,
+            "discharge_to_soc": 0.78,
+            "charge_rate_c": 1.0,
+            "charge_to_soc": 0.79,
+            "period_s": 0.5,
+            "temp_k": 298.15,
+        }
+        cfg_path = self._root / "timeseries_soc_switch_approx.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        payload = summary["timeseries"]
+        self.assertEqual(payload["source_csv"], "generated:soc_switch_approx")
+        self.assertIn("soc_switch_approx", payload)
+        self.assertIn("soc_switch_approx_input_csv", payload["artifacts"])
+        self.assertTrue(Path(payload["artifacts"]["soc_switch_approx_input_csv"]).exists())
+
+        approx = payload["soc_switch_approx"]
+        self.assertTrue(approx["enabled"])
+        self.assertGreater(float(approx["predicted_switch_time_s"]), 0.0)
+        self.assertGreater(float(approx["predicted_end_time_s"]), float(approx["predicted_switch_time_s"]))
+        self.assertIsNotNone(approx["soc_at_predicted_switch"])
+        self.assertIsNotNone(approx["final_soc"])
+        self.assertLess(abs(float(approx["switch_soc_error"])), 0.03)
+        self.assertLess(abs(float(approx["final_soc_error"])), 0.03)
+
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        current = frame["current_a"].to_numpy(dtype=float)
+        self.assertTrue(np.any(current > 0))
+        self.assertTrue(np.any(current < 0))
+        self.assertTrue(np.allclose(frame["boundary_temperature_k"].to_numpy(dtype=float), 298.15))
+
+    def test_timeseries_soc_switch_approx_conflict_with_charge_compare(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "soc_switch_conflict")
+        cfg["timeseries"]["charge_compare"] = {"enabled": True}
+        cfg["timeseries"]["soc_switch_approx"] = {
+            "enabled": True,
+            "soc_start": 0.99,
+            "discharge_rate_c": 1.0,
+            "discharge_to_soc": 0.30,
+            "charge_rate_c": 1.0,
+            "charge_to_soc": 0.90,
+            "period_s": 0.1,
+        }
+        cfg_path = self._root / "timeseries_soc_switch_conflict.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            run_from_config(cfg_path, mode="timeseries")
+        self.assertIn("cannot both be enabled", str(ctx.exception))
+
+    def test_timeseries_soc_switch_approx_invalid_bounds(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "soc_switch_invalid_bounds")
+        cfg["timeseries"]["csv_path"] = ""
+        cfg["timeseries"]["charge_compare"] = {"enabled": False}
+        cfg["timeseries"]["soc_switch_approx"] = {
+            "enabled": True,
+            "soc_start": 0.40,
+            "discharge_rate_c": 1.0,
+            "discharge_to_soc": 0.45,
+            "charge_rate_c": 1.0,
+            "charge_to_soc": 0.90,
+            "period_s": 0.1,
+        }
+        cfg_path = self._root / "timeseries_soc_switch_invalid_bounds.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            run_from_config(cfg_path, mode="timeseries")
+        self.assertIn("discharge_to_soc", str(ctx.exception))
 
     def test_timeseries_validation_fail_fast(self) -> None:
         bad_csv = self._root / "bad_input_non_monotonic.csv"
@@ -705,6 +911,21 @@ class TestTimeseriesPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_from_config(cfg_path, mode="timeseries")
 
+    def test_timeseries_thermal_params_scope_warning_when_not_lumped(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "timeseries_thermal_scope_warning")
+        cfg["model"]["thermal"] = "isothermal"
+        cfg["model"]["thermal_params"] = {
+            "total_heat_transfer_coefficient_w_m2_k": 120.0,
+        }
+        cfg_path = self._root / "timeseries_thermal_scope_warning.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        warnings = [str(item) for item in summary.get("warnings", [])]
+        self.assertTrue(any("model.thermal_params is configured but applies only" in item for item in warnings))
+
     def test_timeseries_termination_time_cutoff(self) -> None:
         cfg = _deep_copy_dict(self._base_config)
         output_dir = self._root / "termination_time_cutoff"
@@ -753,6 +974,68 @@ class TestTimeseriesPipeline(unittest.TestCase):
         frame = pd.read_csv(output_dir / "timeseries_output.csv")
         self.assertIn("ocv_v", frame.columns)
 
+    def test_timeseries_termination_cell_temperature_metric(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "termination_cell_temperature"
+        cfg["output_dir"] = str(output_dir)
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "conditions": [
+                {"metric": "cell_temperature_k", "op": ">=", "threshold": 298.1, "name": "cell_temp_gate"},
+            ],
+        }
+        cfg_path = self._root / "timeseries_termination_cell_temperature.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        case = summary["timeseries"]["case"]
+        self.assertTrue(case["termination"]["hit"])
+        self.assertEqual(case["termination"]["metric"], "cell_temperature_k")
+        frame = pd.read_csv(output_dir / "timeseries_output.csv")
+        self.assertIn("cell_temperature_k", frame.columns)
+
+    def test_timeseries_termination_boundary_temperature_metric(self) -> None:
+        boundary_csv = self._root / "input_timeseries_boundary_for_termination.csv"
+        times = np.arange(0.0, 121.0, 1.0)
+        boundary_series = np.linspace(298.15, 310.15, len(times))
+        frame = pd.DataFrame(
+            {
+                "time_s": times,
+                "current_a": np.zeros(times.shape, dtype=float),
+                "temp_k": boundary_series,
+            }
+        )
+        frame.to_csv(boundary_csv, index=False)
+
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "termination_boundary_temperature"
+        cfg["output_dir"] = str(output_dir)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_coupling"] = {"enabled": True, "boundary_mode": "timeseries"}
+        cfg["timeseries"]["csv_path"] = str(boundary_csv)
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": True,
+            "conditions": [
+                {"metric": "boundary_temperature_k", "op": ">=", "threshold": 304.0, "name": "boundary_temp_gate"},
+            ],
+        }
+        cfg_path = self._root / "timeseries_termination_boundary_temperature.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        case = summary["timeseries"]["case"]
+        self.assertTrue(case["termination"]["hit"])
+        self.assertEqual(case["termination"]["metric"], "boundary_temperature_k")
+        self.assertGreaterEqual(float(case["termination"]["value"]), 304.0)
+        out = pd.read_csv(output_dir / "timeseries_output.csv")
+        self.assertIn("boundary_temperature_k", out.columns)
+
     def test_timeseries_lumped_temp_boundary_from_csv(self) -> None:
         boundary_csv = self._root / "input_timeseries_boundary.csv"
         times = np.arange(0.0, 121.0, 1.0)
@@ -769,16 +1052,76 @@ class TestTimeseriesPipeline(unittest.TestCase):
         output_dir = self._root / "lumped_boundary_outputs"
         cfg["output_dir"] = str(output_dir)
         cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_coupling"] = {"enabled": True, "boundary_mode": "timeseries"}
         cfg["timeseries"]["csv_path"] = str(boundary_csv)
-        cfg["timeseries"]["use_temp_as_ambient_boundary"] = True
+        cfg["timeseries"].pop("use_temp_as_ambient_boundary", None)
         cfg_path = self._root / "timeseries_lumped_boundary.yaml"
         cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
         summary = run_from_config(cfg_path, mode="timeseries")
         self.assertTrue(summary["all_converged"])
         out = pd.read_csv(output_dir / "timeseries_output.csv")
-        temp = out["temperature_k"].to_numpy(dtype=float)
-        self.assertGreater(float(np.max(temp) - np.min(temp)), 1e-3)
+        cell_temp = out["cell_temperature_k"].to_numpy(dtype=float)
+        boundary_temp = out["boundary_temperature_k"].to_numpy(dtype=float)
+        self.assertGreater(float(np.max(cell_temp) - np.min(cell_temp)), 1e-3)
+        self.assertTrue(np.allclose(boundary_temp, np.linspace(298.15, 310.15, len(boundary_temp))))
+
+    def test_timeseries_legacy_temp_boundary_flag_compatibility(self) -> None:
+        boundary_csv = self._root / "input_timeseries_boundary_legacy.csv"
+        times = np.arange(0.0, 121.0, 1.0)
+        frame = pd.DataFrame(
+            {
+                "time_s": times,
+                "current_a": np.zeros(times.shape, dtype=float),
+                "temp_k": np.linspace(298.15, 307.15, len(times)),
+            }
+        )
+        frame.to_csv(boundary_csv, index=False)
+
+        cfg = _deep_copy_dict(self._base_config)
+        output_dir = self._root / "lumped_boundary_legacy_outputs"
+        cfg["output_dir"] = str(output_dir)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["timeseries"]["csv_path"] = str(boundary_csv)
+        cfg["timeseries"]["use_temp_as_ambient_boundary"] = True
+        cfg_path = self._root / "timeseries_lumped_boundary_legacy.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        summary = run_from_config(cfg_path, mode="timeseries")
+        self.assertTrue(summary["all_converged"])
+        out = pd.read_csv(output_dir / "timeseries_output.csv")
+        cell_temp = out["cell_temperature_k"].to_numpy(dtype=float)
+        boundary_temp = out["boundary_temperature_k"].to_numpy(dtype=float)
+        self.assertGreater(float(np.max(cell_temp) - np.min(cell_temp)), 1e-3)
+        self.assertTrue(np.allclose(boundary_temp, np.linspace(298.15, 307.15, len(boundary_temp))))
+
+    def test_timeseries_invalid_thermal_boundary_mode(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["model"]["thermal"] = "lumped"
+        cfg["model"]["thermal_coupling"] = {"enabled": True, "boundary_mode": "invalid-mode"}
+        cfg["output_dir"] = str(self._root / "invalid_thermal_boundary_mode")
+        cfg_path = self._root / "timeseries_invalid_thermal_boundary_mode.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            run_from_config(cfg_path, mode="timeseries")
+
+    def test_timeseries_deprecated_termination_temperature_metric_rejected(self) -> None:
+        cfg = _deep_copy_dict(self._base_config)
+        cfg["output_dir"] = str(self._root / "deprecated_temperature_metric")
+        cfg["termination"] = {
+            "enabled": True,
+            "logic": "any_of",
+            "must_hit": False,
+            "conditions": [
+                {"metric": "temperature_k", "op": ">=", "threshold": 298.15},
+            ],
+        }
+        cfg_path = self._root / "timeseries_deprecated_temperature_metric.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            run_from_config(cfg_path, mode="timeseries")
+        self.assertIn("no longer supported", str(ctx.exception))
+        self.assertIn("cell_temperature_k", str(ctx.exception))
 
     def test_timeseries_termination_must_hit_failure(self) -> None:
         cfg = _deep_copy_dict(self._base_config)
@@ -865,7 +1208,7 @@ class TestChargeComparePipeline(unittest.TestCase):
 
     def test_charge_compare_contract(self) -> None:
         self.assertEqual(self._summary["mode"], "timeseries")
-        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertEqual(self._summary["contract_version"], "3.0.0")
         self.assertIn("contract_fields", self._summary)
         self.assertIn("charge_compare", self._summary)
         payload = self._summary["charge_compare"]
@@ -1067,7 +1410,7 @@ class TestBenchmarkPipeline(unittest.TestCase):
         self.assertTrue((self._output / "benchmark_summary.json").exists())
         self.assertTrue((self._output / "benchmark_compare_report.md").exists())
         self.assertEqual(self._summary["mode"], "benchmark")
-        self.assertEqual(self._summary["contract_version"], "1.1.0")
+        self.assertEqual(self._summary["contract_version"], "3.0.0")
         self.assertIn("contract_fields", self._summary)
         self.assertIn("quality_gate", self._summary)
         self.assertIn("benchmark", self._summary)
@@ -1202,6 +1545,27 @@ class TestIdentificationInputValidation(unittest.TestCase):
         validation = summary["identification_inputs_validation"]
         self.assertFalse(validation["passed"])
         self.assertGreaterEqual(len(validation["errors"]), 1)
+
+
+class TestTemperatureDependenceConfigSamples(unittest.TestCase):
+    def test_nmc_dfn_temperature_dependence_sample_loads(self) -> None:
+        cfg_path = Path("configs/cells/nmc622_150ah/baseline_150ah_nmc622_temp_dep_example.yaml").resolve()
+        cfg = load_config(cfg_path)
+        self.assertEqual(cfg.model_type, "dfn")
+        self.assertTrue(cfg.temperature_dependence.dfn.enabled)
+        overrides = cfg.temperature_dependence.dfn.arrhenius_overrides
+        self.assertIsNotNone(overrides.negative_particle_diffusivity_ea_j_mol)
+        self.assertIsNotNone(overrides.positive_particle_diffusivity_ea_j_mol)
+        self.assertIsNotNone(overrides.negative_exchange_current_ea_j_mol)
+        self.assertIsNotNone(overrides.positive_exchange_current_ea_j_mol)
+
+    def test_lfp_ecm_temperature_dependence_sample_loads(self) -> None:
+        cfg_path = Path("configs/cells/lfp_130ah/baseline_130ah_lfp_ecm_temp_dep_example.yaml").resolve()
+        cfg = load_config(cfg_path)
+        self.assertEqual(cfg.model_type, "ecm")
+        self.assertEqual(cfg.ecm_rc_elements, 2)
+        self.assertIsNotNone(cfg.ecm_fitted_pack_json)
+        self.assertIn("ecm_fitted_pack_temp_2d_2rc.json", str(cfg.ecm_fitted_pack_json))
 
 
 if __name__ == "__main__":

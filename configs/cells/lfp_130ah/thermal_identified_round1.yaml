@@ -1,0 +1,14 @@
+generated_at_utc: '2026-04-16T07:24:22.342957+00:00'
+source:
+  base_config_path: C:\Users\pal\projects\batt_bamm\configs\cells\lfp_130ah\baseline_130ah_lfp.yaml
+  short_eval_config_path: C:\Users\pal\projects\batt_bamm\configs\setups\thermal_eval_130ah_lfp_short_regression.yaml
+  long_eval_config_path: C:\Users\pal\projects\batt_bamm\configs\setups\thermal_eval_130ah_lfp_long_representative.yaml
+  short_target_summary_json: C:\Users\pal\projects\batt_bamm\outputs\thermal_eval_130ah_lfp_short_regression\thermal_eval_summary.json
+  long_target_summary_json: C:\Users\pal\projects\batt_bamm\outputs\thermal_eval_130ah_lfp_long_representative\thermal_eval_summary.json
+  run_output_dir: C:\Users\pal\projects\batt_bamm\outputs\thermal_identify_130ah_lfp_round1
+model:
+  thermal_params:
+    total_heat_transfer_coefficient_w_m2_k: 120.0
+  thermal_property_scales:
+    heat_capacity_scale: 1.0
+    thermal_conductivity_scale: 1.0
