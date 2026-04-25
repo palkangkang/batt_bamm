@@ -121,6 +121,10 @@ pipenv run python -m batt_bamm.ecm_fit_compare `
   --fit-temperature-grid-c -10 25 45 `
   --gate-profile target `
   --improve-threshold 0.2
+
+# External test-data parameter tune (ECM first, then DFN micro-tune)
+pipenv run python -m batt_bamm.external_parameter_tune `
+  --config configs/setups/external_parameter_tune_example.yaml
 ```
 
 ## 4. 能力矩阵
@@ -143,6 +147,7 @@ pipenv run python -m batt_bamm.ecm_fit_compare `
 | LFP 热参数辨识（round-1） | 独立运行器 | `thermal_identify_130ah_lfp_round1.yaml` | 用短窗口残差拟合 `h / heat_capacity_scale / thermal_conductivity_scale`，并在长窗口验证 | `lfp_thermal_ident_summary.json`, `lfp_thermal_ident_trials.csv`, `configs/cells/lfp_130ah/thermal_identified_round1.yaml` | 目标数据缺失时快速失败（除非启用 bootstrap） | 热参数辨识冒烟测试 | 完成 |
 | DFN vs ECM HPPC 对比 | 独立运行器 | 两个 HPPC 配置 + 输出目录 | 分别运行 DFN/ECM HPPC，按 SOC 对齐并计算端电压差 | `hppc_compare_by_soc.csv`, `hppc_compare_summary.json`, `hppc_compare_voltage_delta.png`, `hppc_compare_report.md` | 任一侧失败或 SOC 网格不对齐则对比失败 | 对比测试 | 完成 |
 | DFN 驱动 ECM 拟合（1RC/2RC，多温区） | 独立运行器 | `ecm_fit_compare` CLI 选项 | 在 `-10/25/45°C` 运行 DFN HPPC，拟合 ECM，回放对比并评估增益/门禁 | `ecm_fitted_pack_temp_2d*.json`, `ecm_fit_points_temp_2d*.csv`, `ecm_fit_compare_summary*.json`, `ecm_fit_compare_report*.md` | 任一步失败或门禁未通过返回非零退出码 | `TestEcmFitCompare` | 完成 |
+| 外部测试数据参数调优 | 独立运行器 | `external_parameter_tune` 配置 + manifest | 校验外部 `time_s/current_a/voltage_v` 数据，默认先拟合 ECM，再做 DFN 初始 SOC/容量小范围微调，并输出失败诊断 | `external_fit_summary.json`, `case_diagnostics.csv`, `fit_acceptance_report.md`, `ecm_fitted_pack_temp_2d*.json`, `dfn_fitted_config.yaml` | 数据校验、ECM 或 DFN 失败时保留可行动提示；ECM 失败默认不继续 DFN | `TestExternalParameterTune` | 完成 |
 | 温度相关参数增强 | baseline/hppc/timeseries/benchmark + 拟合运行器 | `model.temperature_dependence.*`, `model.ecm_fitted_pack_json` | DFN Arrhenius 覆盖（可选）+ ECM SOC×temperature R/C 插值 | `parameter_audit.json` + 温度 2D 拟合包产物 | 旧版 1D ECM 包快速失败 | `TestEcmFitCompare`, baseline 测试 | 完成 |
 | 识别输入模板校验 | 全模式 | `identification_inputs.*` | 在不拟合的情况下校验 OCV/CC/HPPC 模板输入 | `summary.identification_inputs_validation` | strict 模式将运行标记失败但不崩溃 | `TestIdentificationInputValidation` | 完成 |
 

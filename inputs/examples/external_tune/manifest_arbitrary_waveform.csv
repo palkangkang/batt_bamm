@@ -1,0 +1,2 @@
+case_id,csv_path,split,initial_soc,nominal_capacity_ah,ambient_temp_k,weight
+case_arbitrary_waveform,case_arbitrary_waveform.csv,train,0.88,150,298.15,1.0

@@ -1,0 +1,32 @@
+base_config_path: ../cells/nmc622_150ah/baseline_150ah_nmc622.yaml
+output_dir: ../../outputs/external_parameter_tune/arbitrary_waveform
+
+target:
+  manifest_csv: ../../inputs/examples/external_tune/manifest_arbitrary_waveform.csv
+  current_sign: discharge_positive
+  default_temp_k: 298.15
+
+fit:
+  min_train_cases: 1
+  models: [ecm, dfn]
+  loss_dynamic_weight: 0.7
+  current_dynamic_threshold_a: 1.0
+  max_nfev: 30
+
+  ecm:
+    enabled: true
+    ecm_order: 2
+    fallback_to_1rc: true
+    soc_grid: [0.2, 0.4, 0.6, 0.8]
+    temp_axis_c: [24.999, 25.001]
+
+  dfn:
+    enabled: true
+    run_only_if_ecm_passed: true
+    max_nfev: 1
+    bounds:
+      initial_soc: [0.05, 0.99]
+      capacity_scale: [0.9, 1.1]
+
+  thermal:
+    enabled: false

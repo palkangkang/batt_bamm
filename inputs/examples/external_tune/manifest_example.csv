@@ -1,0 +1,4 @@
+case_id,csv_path,split,initial_soc,nominal_capacity_ah,ambient_temp_k,weight
+case_train_0p5c,case_train_0p5c.csv,train,0.95,150,298.15,1.0
+case_train_hppc_like,case_train_hppc_like.csv,train,0.80,150,298.15,1.0
+case_validation_1c,case_validation_1c.csv,validation,0.90,150,298.15,1.0
