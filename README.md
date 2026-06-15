@@ -2,7 +2,7 @@
 
 `batt_bamm` 是一个基于 PyBaMM 与本地等效电路扩展的锂电池仿真工程。当前目标是把电芯级 DFN/ECM 仿真、CH-NCM locked 参数包、168 串 pack 工况、故障注入和数据驱动模型评估组织成可复现、可比较、可追溯的一套本地研发平台。
 
-本 README 只作为项目总入口维护。详细契约、运行步骤和专项分析请进入下方报告或对应资产目录。
+本 README 只作为项目总入口维护，重点说明当前工程主线和常用仿真入口。
 
 ## 当前工程主线
 
@@ -15,20 +15,60 @@
 | 168 串 pack | CH-NCM ECM leakage 168 串 pack、车辆工况功率输入、故障注入配置 | `configs/packs/ch_ncm/ecm_leakage_series_168/`, `src/batt_bamm/ch_ncm_pack_fault/` |
 | 虚拟数据与学习材料 | CH-NCM ECM 虚拟充放电数据、PyBaMM 8 周学习路径 | `data/ch_ncm_ecm_virtual_charge_discharge/`, `learning/pybamm_8week/` |
 
-## 代表性专项报告
+## 使用方法
 
-| 专项报告 | 内容定位 |
-| --- | --- |
-| [能力矩阵](docs/capability_matrix.md) | 汇总当前 mode、配置入口、产物、失败语义、测试覆盖与状态。 |
-| [CH-NCM 电芯与 Pack 参数使用说明](docs/ch_ncm_cell_pack_usage.md) | 说明 locked CH-NCM ECM 参数包、168 串 pack、车辆工况和常用复现命令。 |
-| [配置与参数目录说明](configs/configs.md) | 解释 `configs/` 下电芯配置、pack 配置、参数包、车辆规格和输出目录的边界。 |
-| [配置契约](docs/config_contract.md) | 定义配置目录、模型字段、截止条件、热边界、benchmark 和 ECM 拟合包 schema。 |
-| [输出契约](docs/output_contract.md) | 定义 `summary.json`、RunSummary、timeseries CSV、benchmark、质量门禁和 HPPC 对比摘要字段。 |
-| [最小实测闭环执行清单](docs/minimal_field_closed_loop_checklist.md) | 给出 OCV、0.5C 循环、HPPC、拟合门禁和留出验证的最低成本闭环。 |
-| [CH-NCM ECM 锁定参数包](configs/parameter_packs/ch_ncm/locked_ch_ncm_ecm/README.md) | 说明当前推荐 CH-NCM 2RC ECM 参数包、锁定前验证摘要和使用边界。 |
-| [CH-NCM Seq2Seq locked 模型包](configs/model_packs/ch_ncm/locked_ch_ncm_seq2seq_slowfast_v1/README.md) | 说明 slow-fast 三目标预测模型的锁定内容、训练契约、指标和边界。 |
-| [CH-NCM/ECM 虚拟充放电测试数据](data/ch_ncm_ecm_virtual_charge_discharge/README.md) | 说明 11 个虚拟单体、AC/DC 充电、车辆放电连接工况和输出字段。 |
-| [常用命令](docs/common_commands.md) | 收纳 baseline、HPPC、timeseries、benchmark、热评估、拟合和外部数据调优命令。 |
+以下命令默认在仓库根目录 `C:\Users\pal\projects\batt_bamm` 执行，并使用项目约定的 `pipenv run python` 环境。
+
+### Cell 仿真
+
+单体仿真入口统一走 `batt_bamm.main`，通过 `--config` 指定 `configs/cells/` 下的单体 YAML，通过 `--mode` 选择运行流程。
+
+| 目标 | 配置入口 | 命令 |
+| --- | --- | --- |
+| CH-NCM DFN baseline | `configs/cells/ch_ncm/baseline_ch_ncm.yaml` | `pipenv run python -m batt_bamm.main --config configs/cells/ch_ncm/baseline_ch_ncm.yaml --mode baseline` |
+| CH-NCM locked ECM baseline | `configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml` | `pipenv run python -m batt_bamm.main --config configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml --mode baseline` |
+| CH-NCM locked ECM HPPC | `configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml` | `pipenv run python -m batt_bamm.main --config configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml --mode hppc` |
+| CH-NCM locked ECM timeseries/charge compare | `configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml` | `pipenv run python -m batt_bamm.main --config configs/cells/ch_ncm_locked/ecm_ch_ncm_locked.yaml --mode timeseries` |
+
+常见单体输出会进入配置中的 `output_dir`，并包含 `summary.json`、样本 CSV、参数审计和可选图表。若要切换化学体系或模型路线，优先换用 `configs/cells/nmc622_150ah/` 或 `configs/cells/lfp_130ah/` 下的配置，而不是直接改脚本。
+
+### Pack 仿真
+
+Pack 仿真使用 `configs/packs/ch_ncm/ecm_leakage_series_168/` 下的 168 串 CH-NCM ECM leakage 配置。基准 pack YAML 定义串数、OCV/R0/初始 SOC/容量分散、locked ECM 参数包和泄露模型；车辆工况功率输入位于同目录的 `drive_cycles/flagship_5seat_sedan/`。
+
+| 目标 | 命令 | 主要输出 |
+| --- | --- | --- |
+| 168 串恒功率负载示例 | `pipenv run python scripts\simulate_ch_ncm_power_load_series_pack.py` | `outputs/ch_ncm/ecm_leakage_series_168_power_load/` |
+| 168 串 1C 到 5% SOC 一致性示例 | `pipenv run python scripts\simulate_ch_ncm_leakage_series_pack.py` | `outputs/ch_ncm/ecm_leakage_series_168_1c_to_5soc/` |
+| WLTC Class 3b 全放电 | `pipenv run python scripts\simulate_ch_ncm_wltc_full_discharge_168s.py --include-cell-voltages` | `outputs/ch_ncm/wltc_full_discharge_168s_0p1s/` |
+
+Pack 工况 CSV 的核心输入列是 `time_s,battery_power_w,temp_k`；单体功率按 `cell_power_w = battery_power_w / 168` 均分。道路载荷功率曲线是外部负载输入，ECM 参数会影响后续电压、SOC、泄露和一致性结果，不会反向改变功率曲线。
+
+### 故障注入
+
+故障注入入口是 `configs/packs/ch_ncm/ecm_leakage_series_168/ch_ncm_ecm_leakage_168s_fault_injection.yaml`。该文件保留基准 pack 的 `series_pack` 随机分散，并在 `fault_injection` 中定义确定性异常覆盖。
+
+可注入字段包括：
+
+- `capacity_ah` 或 `capacity_percent`：指定容量异常。
+- `initial_soc` 或 `initial_soc_delta`：指定初始 SOC 异常。
+- `self_discharge_rate_ppd`、`leakage_current_a` 或 `parallel_resistance_ohm`：指定自放电/泄露异常。
+- `r0_multiplier`：指定整条 R0-SOC 曲线倍率。
+
+当前虚拟故障数据集默认读取 `fault_injection.scenarios`，并使用 `configs/setups/ch_ncm_pack_fault_virtual_dataset.yaml` 中的 `fault_scenario_ids` 控制要生成的场景。默认场景为 `multi_fault_mixed`。
+
+```powershell
+# 快速 smoke：默认只跑少量模板片段，可用于检查链路
+pipenv run python scripts\run_ch_ncm_pack_fault_virtual_dataset.py --no-train-models
+
+# full：覆盖配置中的全部模板电芯，仍可跳过模型训练以缩短运行时间
+pipenv run python scripts\run_ch_ncm_pack_fault_virtual_dataset.py --full --no-train-models
+
+# 只生成原始场景/工况/测量输出，不做特征、指标、报告和模型训练
+pipenv run python scripts\run_ch_ncm_pack_fault_virtual_dataset.py --simulation-only --run-id run_012
+```
+
+故障数据集默认输出到 `outputs/ch_ncm/pack_fault_virtual_dataset/`。若要在已有 run 上补充或刷新测量与 SOC 时序，可使用 `scripts\refresh_ch_ncm_pack_fault_measurements.py` 和 `scripts\generate_ch_ncm_pack_fault_soc_timeseries.py`，并显式指定 `--run-id`。
 
 ## 目录地图
 
